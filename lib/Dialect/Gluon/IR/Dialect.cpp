@@ -24,7 +24,9 @@ struct GluonInferLayoutInterface : public triton::DialectInferLayoutInterface {
 
   LogicalResult inferAutoEncoding(Attribute operandEncoding,
                                   Attribute &resultEncoding) const {
-    assert(isa<gluon::AutoEncodingAttr>(operandEncoding));
+    if (!isa<gluon::AutoEncodingAttr, gluon::CoalescedEncodingAttr>(
+            operandEncoding))
+      return failure();
     resultEncoding = operandEncoding;
     return success();
   }
@@ -63,6 +65,10 @@ struct GluonInferLayoutInterface : public triton::DialectInferLayoutInterface {
     return success();
   }
 
+  LogicalResult verifyCatOpEncodingCompatibility(Operation *op) const override {
+    return success();
+  }
+
   LogicalResult
   verifyLayoutsAreEqual(ArrayRef<int64_t> shape, Attribute expected,
                         Attribute got,
@@ -72,7 +78,7 @@ struct GluonInferLayoutInterface : public triton::DialectInferLayoutInterface {
 
   LogicalResult
   inferReshapeOpEncoding(ArrayRef<int64_t> srcShape, Attribute srcEnc,
-                         ArrayRef<int64_t> dstShape, Attribute &dstEnc,
+                         ArrayRef<int64_t> dstShape, Attribute &dstEnc, bool,
                          std::optional<Location> loc) const override {
     return inferAutoEncoding(srcEnc, dstEnc);
   }

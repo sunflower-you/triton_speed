@@ -1,8 +1,11 @@
 import argparse
 import sys
 import os
+import runpy
+import traceback
 from .profile import start, finalize, _select_backend
-from .flags import set_command_line
+from .flags import flags
+from triton._C.libproton import proton as libproton
 
 
 def parse_arguments():
@@ -14,12 +17,12 @@ def parse_arguments():
 """, formatter_class=argparse.RawTextHelpFormatter)
     parser.add_argument("-n", "--name", type=str, help="Name of the profiling session")
     parser.add_argument("-b", "--backend", type=str, help="Profiling backend", default=None,
-                        choices=["cupti", "roctracer", "instrumentation"])
+                        choices=libproton.get_available_profilers())
     parser.add_argument("-c", "--context", type=str, help="Profiling context", default="shadow",
                         choices=["shadow", "python"])
     parser.add_argument("-m", "--mode", type=str, help="Profiling mode", default=None)
     parser.add_argument("-d", "--data", type=str, help="Profiling data", default="tree", choices=["tree", "trace"])
-    parser.add_argument("-k", "--hook", type=str, help="Profiling hook", default=None, choices=[None, "launch"])
+    parser.add_argument("-k", "--hook", type=str, help="Profiling hook", default=None, choices=[None, "triton"])
     parser.add_argument('target_args', nargs=argparse.REMAINDER, help='Subcommand and its arguments')
     args = parser.parse_args()
     return args, args.target_args
@@ -31,13 +34,6 @@ def is_pytest(script):
 
 def execute_as_main(script, args):
     script_path = os.path.abspath(script)
-    # Prepare a clean global environment
-    clean_globals = {
-        "__name__": "__main__",
-        "__file__": script_path,
-        "__builtins__": __builtins__,
-        sys.__name__: sys,
-    }
 
     original_argv = sys.argv
     sys.argv = [script] + args
@@ -46,27 +42,31 @@ def execute_as_main(script, args):
 
     # Execute in the isolated environment
     try:
-        with open(script_path, 'rb') as file:
-            code = compile(file.read(), script_path, 'exec')
-        exec(code, clean_globals)
+        runpy.run_path(script, run_name="__main__")
     except Exception as e:
-        print(f"An error occurred while executing the script: {e}")
-        sys.exit(1)
+        print("An error occurred while executing the script:")
+        traceback.print_exception(e)
+        return 1
+    except SystemExit as e:
+        return e.code
+    except KeyboardInterrupt:
+        return 1
     finally:
         sys.argv = original_argv
+    return 0
 
 
 def do_setup_and_execute(target_args):
     # Set the command line mode to avoid any `start` calls in the script.
-    set_command_line()
+    flags.command_line = True
 
     script = target_args[0]
     script_args = target_args[1:] if len(target_args) > 1 else []
     if is_pytest(script):
         import pytest
-        pytest.main(script_args)
+        return pytest.main(script_args)
     else:
-        execute_as_main(script, script_args)
+        return execute_as_main(script, script_args)
 
 
 def run_profiling(args, target_args):
@@ -74,9 +74,10 @@ def run_profiling(args, target_args):
 
     start(args.name, context=args.context, data=args.data, backend=backend, hook=args.hook)
 
-    do_setup_and_execute(target_args)
+    exitcode = do_setup_and_execute(target_args)
 
     finalize()
+    sys.exit(exitcode)
 
 
 def main():

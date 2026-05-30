@@ -6,7 +6,7 @@
 #include "triton/Dialect/TritonGPU/Transforms/Schedule.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
-#include "triton/Tools/Sys/GetEnv.hpp"
+#include "triton/Tools/Sys/GetEnv.h"
 #include "llvm/Support/Debug.h"
 
 #define DEBUG_TYPE "triton-loop-pipeline"
@@ -107,7 +107,7 @@ public:
         return false;
       }
     }
-    if (isa<tt::DescriptorLoadOp, tt::DescriptorGatherOp>(op))
+    if (isa<tt::DescriptorLoadLikeOpInterface>(op))
       return true;
     if (!canHaveSharedEncoding(cast<tt::LoadOp>(op))) {
       LDBG("Load " << *op << " cannot have shared encoding");
@@ -194,11 +194,23 @@ public:
           // overlap. WS does not have this problem because the MMA is placed in
           // a different partition than the MMA, so we can correctly set the
           // latency.
-          if (forOp->hasAttr(kWarpSpecializeAttrName)) {
+          if (isWarpSpecialized(forOp)) {
             if (ttng::hasAccReadModifyWrite(mma, forOp))
               opLatency.erase(&op); // can't pipeline the MMA
             else
               opLatency[&op] += 1;
+            // If all inputs to the MMA are warp specialized, set the self
+            // latency to 0 since the MMA won't need to wait on itself.
+            auto cantWarpSpec = [](Operation *op) { return isa<LoadOp>(op); };
+            auto warpSpecHelper = ttng::MMAv5PipelineableOperandsHelper(
+                mma, forOp, [&](Operation *op) {
+                  return isLoadToBePipelined(op) && !cantWarpSpec(op);
+                });
+            if (warpSpecHelper.isPipelineable ||
+                (warpSpecHelper.isOperandsStateDetermined &&
+                 llvm::none_of(warpSpecHelper.unpipelineableOperandDefs,
+                               cantWarpSpec)))
+              mmaSelfLatency[mma] = 0;
           }
         }
       }
@@ -217,6 +229,17 @@ private:
     }
     return false;
   }
+
+  bool isWarpSpecialized(scf::ForOp forOp) {
+    scf::ForOp current = forOp;
+    do {
+      if (current->hasAttr(kWarpSpecializeAttrName)) {
+        return true;
+      }
+      current = current->getParentOfType<scf::ForOp>();
+    } while (current);
+    return false;
+  };
 };
 
 // Discover operations that should become async and assign latencies to them
@@ -268,7 +291,7 @@ loadOpsToIndirectionLevel(scf::ForOp forOp, bool pipelineWithoutDot,
       [&](Operation *op, Operation *finalUser, int distance) {
         if (!seen.insert(op).second || excluded.count(op))
           return;
-        if (isa<tt::LoadOp, tt::DescriptorLoadOp, tt::DescriptorGatherOp>(op)) {
+        if (isa<tt::LoadOp, tt::DescriptorLoadLikeOpInterface>(op)) {
           if (!AssignLoadLatencies::isPipeliningBeneficial(
                   op, finalUser, axisInfoAnalysis, filterSmall))
             return;
@@ -306,13 +329,11 @@ loadOpsToIndirectionLevel(scf::ForOp forOp, bool pipelineWithoutDot,
         }
       };
 
-  bool seenDot = false;
   for (Operation &op : forOp.getBody()->without_terminator()) {
     // Arbitrary heuristic. TMEMStoreOp is included to keep logic consistent
     // with legacy code when we weren't hoisting tmem allocas.
     if (!isa<mlir::triton::DotOpInterface, ttng::TMEMStoreOp>(op))
       continue;
-    seenDot = true;
     seen.clear();
     dfs(&op, &op, 0);
   }
@@ -321,7 +342,7 @@ loadOpsToIndirectionLevel(scf::ForOp forOp, bool pipelineWithoutDot,
   // that are not directly used by dot ops.
   if (pipelineWithoutDot) {
     for (Operation &op : forOp.getBody()->without_terminator()) {
-      if (!isa<tt::LoadOp, tt::DescriptorLoadOp, tt::DescriptorGatherOp>(op))
+      if (!isa<tt::LoadOp, tt::DescriptorLoadLikeOpInterface>(op))
         dfs(&op, &op, 0);
     }
   }

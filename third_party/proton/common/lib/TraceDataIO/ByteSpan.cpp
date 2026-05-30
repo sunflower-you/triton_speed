@@ -1,12 +1,12 @@
 #include "TraceDataIO/ByteSpan.h"
+#include "Utility/Errors.h"
 
 using namespace proton;
 
 ByteSpan::ByteSpan(const uint8_t *data, size_t size)
     : dataPtr(data), dataSize(size), pos(0) {
   if (data == nullptr && size > 0) {
-    throw std::invalid_argument(
-        "Data pointer cannot be null for non-zero size");
+    throw makeInvalidArgument("Data pointer cannot be null for non-zero size");
   }
 }
 
@@ -45,6 +45,22 @@ uint32_t ByteSpan::readUInt32() {
 
 int32_t ByteSpan::readInt32() { return static_cast<int32_t>(readUInt32()); }
 
+uint64_t ByteSpan::readUInt64() {
+  checkRemaining(8);
+  uint64_t value = static_cast<uint64_t>(dataPtr[pos]) |
+                   (static_cast<uint64_t>(dataPtr[pos + 1]) << 8) |
+                   (static_cast<uint64_t>(dataPtr[pos + 2]) << 16) |
+                   (static_cast<uint64_t>(dataPtr[pos + 3]) << 24) |
+                   (static_cast<uint64_t>(dataPtr[pos + 4]) << 32) |
+                   (static_cast<uint64_t>(dataPtr[pos + 5]) << 40) |
+                   (static_cast<uint64_t>(dataPtr[pos + 6]) << 48) |
+                   (static_cast<uint64_t>(dataPtr[pos + 7]) << 56);
+  pos += 8;
+  return value;
+}
+
+int64_t ByteSpan::readInt64() { return static_cast<int64_t>(readUInt64()); }
+
 void ByteSpan::skip(size_t count) {
   checkRemaining(count);
   pos += count;
@@ -58,4 +74,4 @@ void ByteSpan::seek(size_t position) {
 }
 
 BufferException::BufferException(const std::string &message)
-    : std::runtime_error(message) {}
+    : std::out_of_range(prefixErrorMessage(message)) {}

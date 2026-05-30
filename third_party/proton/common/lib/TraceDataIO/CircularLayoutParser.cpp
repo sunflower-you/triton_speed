@@ -35,14 +35,19 @@ const CircularLayoutParserConfig &CircularLayoutParser::getConfig() const {
   return static_cast<const CircularLayoutParserConfig &>(config);
 }
 
-void CircularLayoutParser::parseMetadata() {
+bool CircularLayoutParser::parseMetadata() {
   uint32_t preamble = decoder.decode<I32Entry>()->value;
+  if (preamble == 0)
+    return false;
   if (preamble != kPreamble)
     throw PreambleException("Invalid preamble");
   auto &bt = result->blockTraces.emplace_back();
   bt.blockId = decoder.decode<I32Entry>()->value;
   bt.procId = decoder.decode<I32Entry>()->value;
   bt.bufSize = decoder.decode<I32Entry>()->value;
+  bt.initTime = decoder.decode<I64Entry>()->value;
+  bt.preFinalTime = decoder.decode<I64Entry>()->value;
+  bt.postFinalTime = decoder.decode<I64Entry>()->value;
 
   std::vector<uint32_t> countVec;
   for (int i = 0; i < getConfig().totalUnits; i++) {
@@ -53,19 +58,23 @@ void CircularLayoutParser::parseMetadata() {
   int maxCountPerUnit = bt.bufSize / getConfig().uidVec.size() / 8;
 
   for (auto uid : getConfig().uidVec) {
+    // Each event is 2 words (8 bytes) and countVec captures the number of words
+    // of each warp captured during profiling
     auto count = countVec[uid];
+    auto numEvent = count / 2;
 
-    if (count > maxCountPerUnit) {
+    if (numEvent > maxCountPerUnit) {
       std::cerr << "Warning (cta" << bt.blockId << ", warp" << uid
-                << "): first " << count - maxCountPerUnit
+                << "): first " << numEvent - maxCountPerUnit
                 << " events are dropped due to insufficient buffer size ("
-                << maxCountPerUnit << "/" << count << ")" << std::endl;
+                << maxCountPerUnit << "/" << numEvent << ")" << std::endl;
     }
 
     auto &trace = bt.traces.emplace_back();
     trace.uid = uid;
     trace.count = count;
   }
+  return true;
 }
 
 void CircularLayoutParser::parseProfileEvents() {
@@ -85,7 +94,6 @@ void CircularLayoutParser::parseProfileEvents() {
 void CircularLayoutParser::parseSegment(
     int segmentByteSize, CircularLayoutParserResult::Trace &trace) {
 
-  auto state = ParseState::INIT;
   int idealSize = trace.count * kWordSize;
   int byteSize = std::min(idealSize, segmentByteSize);
   const int maxNumEntries = byteSize / (kWordSize * kWordsPerEntry);
@@ -137,8 +145,9 @@ void CircularLayoutParser::parseSegment(
 
 void CircularLayoutParser::parseBlock() {
   try {
-    parseMetadata();
-    parseProfileEvents();
+    if (parseMetadata()) {
+      parseProfileEvents();
+    } // else skip this block since it's not profiled
   } catch (const PreambleException &e) {
     reportException(e, buffer.position());
   }
@@ -190,7 +199,7 @@ proton::readCircularLayoutTrace(ByteSpan &buffer, bool applyTimeShift) {
   assert(version == 1 && "Version mismatch");
   buffer.skip(8);
   uint32_t payloadOffset = decoder.decode<I32Entry>()->value;
-  uint32_t payloadSize = decoder.decode<I32Entry>()->value;
+  [[maybe_unused]] uint32_t payloadSize = decoder.decode<I32Entry>()->value;
   uint32_t device = decoder.decode<I32Entry>()->value;
   config.device = decodeDevice(device);
   config.numBlocks = decoder.decode<I32Entry>()->value;

@@ -1,12 +1,11 @@
 import functools
 import triton
-import os
-import pathlib
 
-from triton import knobs
-from triton._C.libproton import proton as libproton
-from .flags import set_profiling_off, set_profiling_on, is_command_line
+from triton._C.libproton import proton as libproton  # type: ignore
+from triton._C.libtriton import getenv  # type: ignore
+from .flags import flags
 from .hooks import HookManager, LaunchHook, InstrumentationHook
+from .hooks.hook import Hook
 from .mode import BaseMode
 from typing import Optional, Union
 
@@ -15,24 +14,7 @@ DEFAULT_PROFILE_NAME = "proton"
 
 def _select_backend() -> str:
     backend = triton.runtime.driver.active.get_current_target().backend
-    if backend == "cuda":
-        return "cupti"
-    elif backend == "hip":
-        return "roctracer"
-    else:
-        raise ValueError("No backend is available for the current target.")
-
-
-def _get_backend_default_path(backend: str) -> str:
-    lib_path = ""
-    if backend == "cupti":
-        # First try to get the path from the environment variable that overrides the default path
-        lib_path = knobs.proton.cupti_dir
-        if lib_path is None:
-            # Get the default path for the cupti backend,
-            # which is the most compatible with the current CUPTI header file triton is compiled with
-            lib_path = str(pathlib.Path(__file__).parent.parent.absolute() / "backends" / "nvidia" / "lib" / "cupti")
-    return lib_path
+    return libproton.select_profiler_from_triton_backend(backend)
 
 
 def _get_mode_str(backend: str, mode: Optional[Union[str, BaseMode]]) -> str:
@@ -43,13 +25,28 @@ def _get_mode_str(backend: str, mode: Optional[Union[str, BaseMode]]) -> str:
 
 
 def _check_env(backend: str) -> None:
-    if backend == "roctracer":
+    if backend in ("rocprofiler", "roctracer"):
         hip_device_envs = ["HIP_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES"]
         for env in hip_device_envs:
-            if os.getenv(env, None) is not None:
+            if getenv(env, None) is not None:
                 raise ValueError(
                     f"Proton does not work when the environment variable {env} is set on AMD GPUs. Please unset it and use `ROCR_VISIBLE_DEVICES` instead"
                 )
+
+    use_blackwell_cupti = backend == "cupti" and triton.runtime.driver.active.get_current_target().arch >= 100
+
+    # Ensure default envs are set for Proton knobs if not already set by the user.
+    for attr, desc in triton.knobs.proton.knob_descriptors.items():
+        key = desc.key
+        if getenv(key, None) is None:
+            if key == "TRITON_CUPTI_LIB_PATH" and use_blackwell_cupti:
+                # For Blackwell+ GPUs, use the cupti library built for Blackwell.
+                triton.knobs.setenv(key, triton.knobs.proton.cupti_lib_blackwell_dir)
+                continue
+            val = getattr(triton.knobs.proton, attr)
+            if val is not None:
+                if env_val := triton.knobs.toenv(val):
+                    triton.knobs.setenv(key, env_val[0])
 
 
 def start(
@@ -59,8 +56,8 @@ def start(
     data: Optional[str] = "tree",
     backend: Optional[str] = None,
     mode: Optional[Union[str, BaseMode]] = None,
-    hook: Optional[str] = None,
-):
+    hook: Optional[Union[str, Hook]] = None,
+) -> Optional[int]:
     """
     Start profiling with the given name and backend.
 
@@ -83,40 +80,50 @@ def start(
                               Available options are ["tree", "trace"].
                               Defaults to "tree".
         backend (str, optional): The backend to use for profiling.
-                                 Available options are [None, "cupti", "roctracer", "instrumentation"].
+                                 Available options are [None, "cupti", "rocprofiler", "roctracer", "instrumentation"].
                                  Defaults to None, which automatically selects the backend matching the current active runtime.
+                                 On AMD GPUs, "rocprofiler" is preferred and will fall back to "roctracer" if
+                                 rocprofiler-sdk is not available.
         mode (Union[str, BaseMode], optional): The "mode" to use for profiling, which is specific to the backend.
                                                Can be a string or an instance of BaseMode (or any subclass thereof).
                                                Defaults to None.
-                                               For "cupti", available options are [None, "pcsampling"].
-                                               For "roctracer", available options are [None].
+                                               For "cupti", available options are [None, "pcsampling", "periodic_flushing"].
+                                               For "rocprofiler", available options are [None, "periodic_flushing"].
+                                               For "roctracer", available options are [None, "periodic_flushing"].
                                                For "instrumentation", available options are [None].
                                                Each mode has a set of control knobs following with the mode name.
-                                               For example, "pcsampling" has an "interval" control knob, expressed as "pcsampling:interval=1000".
-        hook (str, optional): The hook to use for profiling.
-                              Available options are [None, "launch"].
-                              Defaults to None.
+                                               For example, "periodic_flushing" mode has a knob:
+                                               - format: The output format of the profiling results. Available options are ["hatchet", "hatchet_msgpack", "chrome_trace"]. Default is "hatchet".
+                                               The can be set via `mode="periodic_flushing:format=chrome_trace"`.
+        hook (Union[str, Hook], optional): The hook to use for profiling.
+                                           You may pass either:
+                                           - a string hook name, e.g. "triton" (kernel launch metadata), or
+                                           - a custom Hook instance.
+                                           Defaults to None.
     Returns:
-        session (int): The session ID of the profiling session.
+        session (Optional[int]): The session ID of the profiling session, or None if profiling is disabled.
     """
-    if is_command_line():
-        # Ignore the start() call if the script is run from the command line.
-        return
+    if flags.command_line or triton.knobs.proton.disable:
+        # Ignore the start() call if the script is run from the command line or profiling is disabled.
+        return None
 
-    set_profiling_on()
+    flags.profiling_on = True
 
     name = DEFAULT_PROFILE_NAME if name is None else name
     backend = _select_backend() if backend is None else backend
-    backend_path = _get_backend_default_path(backend)
+    # Convert mode to its string representation for libproton's runtime
     mode_str = _get_mode_str(backend, mode)
 
     _check_env(backend)
 
-    # Convert mode to its string representation for libproton's runtime
-    session = libproton.start(name, context, data, backend, mode_str, backend_path)
+    session = libproton.start(name, context, data, backend, mode_str)
 
-    if hook == "triton":
+    if isinstance(hook, Hook):
+        HookManager.register(hook, session)
+    elif hook == "triton":
         HookManager.register(LaunchHook(), session)
+    elif hook is not None:
+        raise ValueError(f"Unsupported hook: {hook!r}")
     if backend == "instrumentation":
         HookManager.register(InstrumentationHook(mode), session)
 
@@ -134,7 +141,7 @@ def activate(session: Optional[int] = None) -> None:
     Returns:
         None
     """
-    if is_command_line() and session != 0:
+    if flags.command_line and session != 0:
         raise ValueError("Only one session can be activated when running from the command line.")
 
     HookManager.activate(session)
@@ -145,26 +152,27 @@ def activate(session: Optional[int] = None) -> None:
         libproton.activate(session)
 
 
-def deactivate(session: Optional[int] = None) -> None:
+def deactivate(session: Optional[int] = None, flushing: bool = False) -> None:
     """
     Stop the specified session.
     The profiling session's data will still be in the memory, but no more data will be recorded.
 
     Args:
         session (int): The session ID of the profiling session. Defaults to None (all sessions)
+        flushing (bool): Whether to flush the profiling data before deactivating. Defaults to True.
 
     Returns:
         None
     """
-    if is_command_line() and session != 0:
+    if flags.command_line and session != 0:
         raise ValueError("Only one session can be deactivated when running from the command line.")
 
     HookManager.deactivate(session)
 
     if session is None:
-        libproton.deactivate_all()
+        libproton.deactivate_all(flushing)
     else:
-        libproton.deactivate(session)
+        libproton.deactivate(session, flushing)
 
 
 def finalize(session: Optional[int] = None, output_format: Optional[str] = "") -> None:
@@ -175,7 +183,7 @@ def finalize(session: Optional[int] = None, output_format: Optional[str] = "") -
     Args:
         session (int, optional): The session ID to finalize. If None, all sessions are finalized. Defaults to None.
         output_format (str, optional): The output format for the profiling results.
-                                       Available options are ["hatchet", "chrome_trace"].
+                                       Available options are ["hatchet", "hatchet_msgpack", "chrome_trace"].
 
     Returns:
         None
@@ -183,10 +191,10 @@ def finalize(session: Optional[int] = None, output_format: Optional[str] = "") -
     HookManager.unregister(session)
 
     if session is None:
-        set_profiling_off()
+        flags.profiling_on = False
         libproton.finalize_all(output_format)
     else:
-        if is_command_line() and session != 0:
+        if flags.command_line and session != 0:
             raise ValueError("Only one session can be finalized when running from the command line.")
         libproton.finalize(session, output_format)
 
@@ -198,7 +206,7 @@ def _profiling(
     data: Optional[str] = "tree",
     backend: Optional[str] = None,
     mode: Optional[str] = None,
-    hook: Optional[str] = None,
+    hook: Optional[Union[str, Hook]] = None,
 ):
     """
     Context manager for profiling. Internally use only.
@@ -228,7 +236,7 @@ def profile(
     data: Optional[str] = "tree",
     backend: Optional[str] = None,
     mode: Optional[str] = None,
-    hook: Optional[str] = None,
+    hook: Optional[Union[str, Hook]] = None,
 ):
     """
     Decorator for profiling.

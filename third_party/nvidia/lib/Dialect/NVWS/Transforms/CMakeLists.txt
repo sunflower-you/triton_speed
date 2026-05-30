@@ -4,6 +4,8 @@ add_triton_library(NVWSTransforms
   InsertAref.cpp
   Utilities.cpp
   AssignStagePhase.cpp
+  InsertTmemAref.cpp
+  HoistTmemStore.cpp
 
   DEPENDS
   NVWSTransformsIncGen

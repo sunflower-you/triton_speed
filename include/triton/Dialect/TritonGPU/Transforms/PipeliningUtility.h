@@ -2,6 +2,7 @@
 #define TRITON_TRITONGPU_TRANSFORMS_PIPELINER_PIPELINING_UTILITY_H_
 
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include <optional>
 #include <utility>
@@ -40,7 +41,10 @@ bool isPureScalarOp(Operation *op);
 bool getDominatingValueSetOpsToHoist(
     DominanceInfo &domInfo, Operation *refOp, ArrayRef<Value> valueSet,
     llvm::SetVector<Operation *> &toHoist,
-    function_ref<bool(Operation *)> canHoist = isPureScalarOp);
+    function_ref<bool(Operation *)> canHoist = isPureScalarOp,
+    function_ref<bool(BlockArgument)> canUseArg = [](BlockArgument) {
+      return false;
+    });
 
 // Hoist the given set of operations above the reference operation.
 void hoistOpsBefore(Operation *refOp,
@@ -74,8 +78,7 @@ Operation *wrapInMaskOp(RewriterBase &rewriter, Operation *op, Value pred);
 
 // Utilize high level predication abstraction to perform optimizations before
 // lowering to predicated operations
-void resolveMaskOp(ModuleOp moduleOp,
-                   DenseSet<triton::gpu::MaskOp> &peeledMaskOps);
+void resolveMaskOp(ModuleOp moduleOp);
 
 // Return true if the given ForOp has the attribute
 // `tt.disallow_acc_multi_buffer` set to true.
@@ -121,14 +124,24 @@ Value createAlloc(Operation *insertBefore, RankedTensorType ty, Location loc,
                   gpu::SharedEncodingTrait sharedEnc, unsigned distance);
 
 // Determine if the operation is a TMA load.
-bool isTMALoad(Operation *op);
+inline bool isTMALoad(Operation *op) {
+  return isa<DescriptorLoadLikeOpInterface>(op);
+}
 
 // Determine if the operation can be lowered to an async load.
 bool canBeAsyncLoad(Operation *op);
 
-// Look for consecutive wait ops and combine them into a single wait op.
+// Fold consecutive wait ops of the same kind into a single wait.
+// `isCounterBarrier` returns true on ops that act as a hard boundary while
+// scanning forward (typically the producers whose tokens a later wait
+// consumes). `createWait` builds the merged wait from the union of operand
+// tokens and the minimum `num`.
 void combineRedundantWaitOps(
-    llvm::SmallSetVector<gpu::AsyncWaitOp, 8> &waitOps);
+    llvm::SmallSetVector<Operation *, 8> &waitOps,
+    llvm::function_ref<bool(Operation * /*candidate*/)> isCounterBarrier,
+    llvm::function_ref<Operation *(OpBuilder &, Location,
+                                   ValueRange /*operands*/, unsigned /*num*/)>
+        createWait);
 
 // Get the type of the view of a multi-buffered tensor value.
 gpu::MemDescType getBufferViewType(gpu::MemDescType allocTy,
@@ -179,6 +192,8 @@ getLastUseOfPipelinedOp(ArrayRef<Operation *> ops, scf::ForOp forOp,
                         CoarseSchedule &schedule,
                         std::function<bool(Operation *)> filterUse = nullptr);
 
+// Clean up attributes passing over schedules across stages in pipelining
+void removePipeliningAttributes(ModuleOp moduleOp);
 } // namespace triton
 } // namespace mlir
 

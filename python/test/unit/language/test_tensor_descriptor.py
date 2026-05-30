@@ -4,7 +4,7 @@ import numpy as np
 
 import triton
 import triton.language as tl
-from triton._internal_testing import is_hopper, is_interpreter, numpy_random, to_triton, unwrap_tensor, tma_dtypes, to_numpy
+from triton._internal_testing import is_hopper, is_sm12x, is_interpreter, numpy_random, to_triton, unwrap_tensor, tma_dtypes, to_numpy
 from triton.tools.mxfp import MXFP4Tensor, MXScaleTensor
 from typing import Optional
 from triton._internal_testing import is_cuda, is_hip, is_hip_cdna3
@@ -309,7 +309,7 @@ def test_tensor_descriptor_load_nd(dtype_str, num_ctas, ndim, INNER_BLOCK, devic
     # Check in-bounds
     actual = unwrap_tensor(out)
     expect = unwrap_tensor(inp)
-    idx = [slice(None, s) for s in inp.shape]
+    idx = tuple(slice(None, s) for s in inp.shape)
     torch.testing.assert_close(expect, actual[idx])
 
     # Check out-of-bounds
@@ -374,7 +374,7 @@ def test_tensor_descriptor_store_nd(dtype_str, num_ctas, ndim, INNER_BLOCK, devi
     # Check in-bounds
     actual = unwrap_tensor(out)
     expect = unwrap_tensor(inp)
-    idx = [slice(None, s) for s in desc_shape]
+    idx = tuple(slice(None, s) for s in desc_shape)
     torch.testing.assert_close(expect[idx], actual[idx])
 
     # Check out-of-bounds
@@ -384,7 +384,7 @@ def test_tensor_descriptor_store_nd(dtype_str, num_ctas, ndim, INNER_BLOCK, devi
 
 
 @pytest.mark.interpreter
-def test_tensor_descriptor_padding():
+def test_tensor_descriptor_padding(device):
 
     @triton.jit
     def device_tma_load(in_ptr, out_ptr, IM, IN, YM, YN, M_BLOCK: tl.constexpr, N_BLOCK: tl.constexpr,
@@ -415,7 +415,7 @@ def test_tensor_descriptor_padding():
 
     # TMA descriptors require a global memory allocation
     def alloc_fn(size: int, alignment: float, stream: float):
-        return torch.ones(size, device="cuda", dtype=torch.float32)
+        return torch.ones(size, device=device, dtype=torch.float32)
 
     triton.set_allocator(alloc_fn)
 
@@ -424,16 +424,16 @@ def test_tensor_descriptor_padding():
     M_BLOCK = 32
     N_BLOCK = 32
     padding = "nan"
-    input = torch.arange(IM * IN, device="cuda", dtype=torch.float32)
+    input = torch.arange(IM * IN, device=device, dtype=torch.float32)
     input = input.reshape(IM, IN)
-    out_device_tma = torch.zeros((OM, ON), device="cuda", dtype=torch.float32)
-    out_host_tma = torch.zeros((OM, ON), device="cuda", dtype=torch.float32)
+    out_device_tma = torch.zeros((OM, ON), device=device, dtype=torch.float32)
+    out_host_tma = torch.zeros((OM, ON), device=device, dtype=torch.float32)
     dummy_block = [M_BLOCK, N_BLOCK]
     in_desc = TensorDescriptor(input, input.shape, input.stride(), dummy_block, padding=padding)
     grid = (triton.cdiv(OM, M_BLOCK), triton.cdiv(ON, N_BLOCK))
     device_tma_load[grid](input, out_device_tma, IM, IN, OM, ON, M_BLOCK, N_BLOCK, padding)
     host_tma_load[grid](in_desc, out_host_tma, OM, ON, M_BLOCK, N_BLOCK)
-    expected = torch.zeros((OM, ON), device="cuda", dtype=torch.float32)
+    expected = torch.zeros((OM, ON), device=device, dtype=torch.float32)
     expected[0:IN, 0:IM] = input
     expected[:, IN:ON] = float('nan')
     expected[IM:OM, :] = float('nan')
@@ -1007,7 +1007,7 @@ def test_tensor_descriptor_rank_reducing_load(dtype_str, ndim, INNER_BLOCK, devi
     # Check in-bounds
     actual = unwrap_tensor(out)
     expect = unwrap_tensor(inp)
-    idx = [slice(None, s) for s in inp.shape]
+    idx = tuple(slice(None, s) for s in inp.shape)
     torch.testing.assert_close(expect, actual[idx])
 
     # Check out-of-bounds
@@ -1182,6 +1182,8 @@ def test_tensor_descriptor_reshape_matmul(dtype_str, device):
     BLOCK_SIZE_N = 64
     BLOCK_SIZE_K = 64
 
+    torch.manual_seed(42)
+
     # trunc float32 to avoid large precision differences.
     def trunc_to_tf32(tensor):
         int_view = tensor.view(np.uint32)
@@ -1191,7 +1193,7 @@ def test_tensor_descriptor_reshape_matmul(dtype_str, device):
         return tf32_simulated
 
     # test a layout where block_m and block_N are split into two separate chunks.
-    A = numpy_random((M, K), dtype_str)
+    A = numpy_random((M, K), dtype_str) - 0.25
     if dtype_str == "float32":
         A = trunc_to_tf32(A)
 
@@ -1204,7 +1206,7 @@ def test_tensor_descriptor_reshape_matmul(dtype_str, device):
     A = to_triton(A, device=device, dst_type=dtype_str)
     A_reshaped = to_triton(A_reshaped, device=device, dst_type=dtype_str)
 
-    B = numpy_random((N, K), dtype_str)
+    B = numpy_random((N, K), dtype_str) - 0.25
     if dtype_str == "float32":
         B = trunc_to_tf32(B)
 
@@ -1307,6 +1309,7 @@ def mxfp8_mxfp4_matmul_tma(  #
     tl.store(output_ptrs, accumulator, mask=c_mask)
 
 
+@pytest.mark.interpreter
 @pytest.mark.parametrize("M, N, K", [(1024, 512, 256), (128, 256, 256), (8192, 8192, 8192)])
 @pytest.mark.parametrize("BLOCK_M, BLOCK_N, BLOCK_K", [(128, 128, 128), (128, 128, 256), (128, 256, 128),
                                                        (128, 256, 256)])
@@ -1374,8 +1377,9 @@ def torch_gather_rows(input, idx, y, block_y):
 @pytest.mark.parametrize("BLOCK_X, BLOCK_Y", [(32, 32), (64, 128), (16, 128), (512, 16)])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.int8])
 @pytest.mark.parametrize("y", [0, 32, 48])
+@pytest.mark.parametrize("idx_dtype", [torch.int32, torch.int16])
 @pytest.mark.skipif(is_hopper(), reason="TMA Scatter is not supported on hopper")
-def test_tma_gather(X, Y, BLOCK_X, BLOCK_Y, dtype, y, device):
+def test_tma_gather(X, Y, BLOCK_X, BLOCK_Y, dtype, y, idx_dtype, device):
     if BLOCK_X > X or y + BLOCK_Y > Y:
         pytest.skip()
 
@@ -1386,7 +1390,7 @@ def test_tma_gather(X, Y, BLOCK_X, BLOCK_Y, dtype, y, device):
         input = torch.arange(X * Y, dtype=dtype, device=device).reshape(X, Y)
     output = torch.empty((BLOCK_X, BLOCK_Y), dtype=dtype, device=device)
 
-    idx = torch.randint(BLOCK_X, (BLOCK_X, ), dtype=torch.int32, device=device)
+    idx = torch.randint(BLOCK_X, (BLOCK_X, ), dtype=idx_dtype, device=device)
 
     def alloc_fn(size: int, align: int, steam):
         return torch.empty(size, dtype=torch.int8, device=device)
@@ -1473,19 +1477,21 @@ def tma_scatter_rows_kernel(out_ptr, in_ptr, idx_ptr, y, X: tl.constexpr, Y: tl.
 @pytest.mark.parametrize("BLOCK_X, BLOCK_Y", [(32, 32), (64, 128), (16, 128), (512, 16)])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.int8])
 @pytest.mark.parametrize("y", [0, 32, 48])
+@pytest.mark.parametrize("idx_dtype", [torch.int32, torch.int16])
 @pytest.mark.skipif(is_hopper(), reason="TMA Scatter is not supported on hopper")
-def test_tma_scatter(X, Y, BLOCK_X, BLOCK_Y, dtype, y):
+@pytest.mark.skipif(is_sm12x(), reason="TMA Scatter is not supported on sm120")
+def test_tma_scatter(X, Y, BLOCK_X, BLOCK_Y, dtype, y, idx_dtype, device):
     if BLOCK_X > X or y + BLOCK_Y > Y:
         pytest.skip()
 
     torch.manual_seed(42)
-    input = torch.arange(BLOCK_X * BLOCK_Y, dtype=dtype, device='cuda').reshape(BLOCK_X, BLOCK_Y)
-    output = torch.zeros((X, Y), dtype=dtype, device='cuda')
+    input = torch.arange(BLOCK_X * BLOCK_Y, dtype=dtype, device=device).reshape(BLOCK_X, BLOCK_Y)
+    output = torch.zeros((X, Y), dtype=dtype, device=device)
 
-    idx = torch.randperm(BLOCK_X, dtype=torch.int32, device='cuda')
+    idx = torch.randperm(BLOCK_X, dtype=idx_dtype, device=device)
 
     def alloc_fn(size: int, align: int, steam):
-        return torch.empty(size, dtype=torch.int8, device='cuda')
+        return torch.empty(size, dtype=torch.int8, device=device)
 
     triton.set_allocator(alloc_fn)
 
@@ -1546,7 +1552,7 @@ REDUCE_SKIP_HIP_CDNA3 = [
 @pytest.mark.parametrize("num_ctas", [1, 2])
 @pytest.mark.parametrize("descriptor", ["host", "device"])
 @pytest.mark.parametrize("M_BLOCK,N_BLOCK", [(2, 16), (8, 16), (8, 32), (8, 128), (512, 32), (1, 1024)])
-def test_tensor_descriptor_reduce(kind, descriptor, dtype_str, num_ctas, M_BLOCK, N_BLOCK):
+def test_tensor_descriptor_reduce(kind, descriptor, dtype_str, num_ctas, M_BLOCK, N_BLOCK, device):
     is_native = is_cuda() and torch.cuda.get_device_capability()[0] >= 9
     if not is_native:
         if num_ctas != 1:
@@ -1596,8 +1602,8 @@ def test_tensor_descriptor_reduce(kind, descriptor, dtype_str, num_ctas, M_BLOCK
 
     M, N = M_BLOCK * 2, N_BLOCK * 2
     rs = np.random.RandomState(seed=17)
-    inp = to_triton(numpy_random((M, N), dtype_str, rs), device="cuda", dst_type=dtype_str)
-    out = to_triton(numpy_random((M, N), dtype_str, rs), device="cuda", dst_type=dtype_str)
+    inp = to_triton(numpy_random((M, N), dtype_str, rs), device=device, dst_type=dtype_str)
+    out = to_triton(numpy_random((M, N), dtype_str, rs), device=device, dst_type=dtype_str)
 
     grid_m = M // M_BLOCK
     grid_n = N // N_BLOCK
@@ -1610,7 +1616,7 @@ def test_tensor_descriptor_reduce(kind, descriptor, dtype_str, num_ctas, M_BLOCK
             assert size == 128 * (grid_m * grid_n) * num_ctas
             assert align == 128
             assert stream == 0
-            return torch.empty(size, dtype=torch.int8, device="cuda")
+            return torch.empty(size, dtype=torch.int8, device=device)
 
         triton.set_allocator(alloc_fn)
         out_desc = None
@@ -1656,6 +1662,55 @@ def test_host_tensor_descriptor_load(dtype_str, num_ctas, M_BLOCK, N_BLOCK, devi
     kernel[(1, )](out, inp_desc, M, N, M_BLOCK, N_BLOCK, num_ctas=num_ctas)
 
     expect = unwrap_tensor(inp)[1 * M_BLOCK:2 * M_BLOCK, 2 * N_BLOCK:3 * N_BLOCK]
+    torch.testing.assert_close(expect, unwrap_tensor(out))
+
+
+@pytest.mark.interpreter()
+@pytest.mark.parametrize("dtype_str", tma_dtypes)
+def test_host_tensor_descriptor_in_tuple(dtype_str, device):
+
+    @triton.jit(debug=True)
+    def kernel(out_ptr, payload, M, N, M_BLOCK: tl.constexpr, N_BLOCK: tl.constexpr):
+        desc0 = payload[0]
+        desc1 = payload[1]
+        m_idx = payload[2]
+
+        assert desc0.shape[0] == M
+        assert desc0.shape[1] == N
+        assert desc0.strides[0] == N
+        assert desc0.strides[1] == 1
+        assert desc0.block_shape == [M_BLOCK, N_BLOCK]
+
+        assert desc1.shape[0] == M * 2
+        assert desc1.shape[1] == N + 16
+        assert desc1.strides[0] == N + 16
+        assert desc1.strides[1] == 1
+        assert desc1.block_shape == [M_BLOCK, N_BLOCK]
+
+        block0 = desc0.load([m_idx * M_BLOCK, N_BLOCK])
+        block1 = desc1.load([m_idx * M_BLOCK, 2 * N_BLOCK])
+        block = block0 + block1
+        idx = tl.arange(0, M_BLOCK)[:, None] * N_BLOCK + tl.arange(0, N_BLOCK)[None, :]
+        tl.store(out_ptr + idx, block)
+
+    M_BLOCK, N_BLOCK = 8, 16
+    m_idx = 2
+    M, N = M_BLOCK * 4, N_BLOCK * 4
+    # Keep ranges small to avoid integer overflow
+    inp0_np = numpy_random((M, N), dtype_str, low=0, high=32)
+    inp1_np = numpy_random((M * 2, N + 16), dtype_str, low=0, high=32)
+
+    inp0 = to_triton(inp0_np, device=device, dst_type=dtype_str)
+    inp1 = to_triton(inp1_np, device=device, dst_type=dtype_str)
+    out = inp0.new_empty((M_BLOCK, N_BLOCK))
+
+    inp_desc0 = TensorDescriptor.from_tensor(inp0, [M_BLOCK, N_BLOCK])
+    inp_desc1 = TensorDescriptor.from_tensor(inp1, [M_BLOCK, N_BLOCK])
+    kernel[(1, )](out, (inp_desc0, inp_desc1, m_idx), M, N, M_BLOCK, N_BLOCK)
+
+    expect0 = unwrap_tensor(inp0)[m_idx * M_BLOCK:(m_idx + 1) * M_BLOCK, N_BLOCK:2 * N_BLOCK]
+    expect1 = unwrap_tensor(inp1)[m_idx * M_BLOCK:(m_idx + 1) * M_BLOCK, 2 * N_BLOCK:3 * N_BLOCK]
+    expect = expect0 + expect1
     torch.testing.assert_close(expect, unwrap_tensor(out))
 
 

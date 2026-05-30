@@ -75,16 +75,21 @@ class FileCacheManager(CacheManager):
         if not self.has_file(grp_filename):
             return None
         grp_filepath = self._make_path(grp_filename)
-        with open(grp_filepath) as f:
-            grp_data = json.load(f)
+        try:
+            with open(grp_filepath) as f:
+                grp_data = json.load(f)
+        except Exception:
+            # exit on corrupted cache.
+            return None
         child_paths = grp_data.get("child_paths", None)
         # Invalid group data.
         if child_paths is None:
             return None
         result = {}
         for c, p in child_paths.items():
-            if os.path.exists(p):
-                result[c] = p
+            if not os.path.exists(p):
+                return None
+            result[c] = p
         return result
 
     # Note a group of pushed files as being part of a group
@@ -214,16 +219,23 @@ class RemoteCacheManager(CacheManager):
         grp_filepath = self.get_file(grp_filename)
         if grp_filepath is None:
             return None
-        with open(grp_filepath) as f:
-            grp_data = json.load(f)
+        try:
+            with open(grp_filepath) as f:
+                grp_data = json.load(f)
+        except Exception:
+            # exit on corrupted cache.
+            return None
         child_paths = grp_data.get("child_paths", None)
 
         result = None
 
         # Found group data.
         if child_paths is not None:
+            child_data = self._backend.get(child_paths)
+            if len(child_data) != len(child_paths):
+                return None
             result = {}
-            for child_path, data in self._backend.get(child_paths).items():
+            for child_path, data in child_data.items():
                 result[child_path] = self._materialize(child_path, data)
 
         return result

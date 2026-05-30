@@ -9,14 +9,7 @@
 
 using namespace mlir::triton::gpu;
 
-namespace mlir::triton::gpu {
-
-Type getElementType(Value value) {
-  auto type = value.getType();
-  if (auto tensorType = dyn_cast<RankedTensorType>(type))
-    return tensorType.getElementType();
-  return type;
-}
+namespace {
 
 int getNumElementsPerThreads(Type type,
                              const LLVMTypeConverter *typeConverter) {
@@ -30,9 +23,6 @@ int getNumElementsPerThreads(Type type,
   return numElemsPerThread;
 }
 
-} // namespace mlir::triton::gpu
-
-namespace {
 struct AddPtrOpConversion : public ConvertOpToLLVMPattern<AddPtrOp> {
   using ConvertOpToLLVMPattern<AddPtrOp>::ConvertOpToLLVMPattern;
 
@@ -83,9 +73,9 @@ struct CmpIOpConversion
                                           Type elemTy,
                                           MultipleOperandsRange operands,
                                           Location loc) const {
-    return {rewriter.create<LLVM::ICmpOp>(
-        loc, elemTy, ArithCmpIPredicateToLLVM(op.getPredicate()),
-        operands[0][0], operands[0][1])};
+    return {LLVM::ICmpOp::create(rewriter, loc, elemTy,
+                                 ArithCmpIPredicateToLLVM(op.getPredicate()),
+                                 operands[0][0], operands[0][1])};
   }
 
   static LLVM::ICmpPredicate
@@ -123,9 +113,9 @@ struct CmpFOpConversion
   createDestOps(arith::CmpFOp op, OpAdaptor adaptor,
                 ConversionPatternRewriter &rewriter, Type elemTy,
                 MultipleOperandsRange operands, Location loc) {
-    return {rewriter.create<LLVM::FCmpOp>(
-        loc, elemTy, ArithCmpFPredicateToLLVM(op.getPredicate()),
-        operands[0][0], operands[0][1])};
+    return {LLVM::FCmpOp::create(rewriter, loc, elemTy,
+                                 ArithCmpFPredicateToLLVM(op.getPredicate()),
+                                 operands[0][0], operands[0][1])};
   }
 
   static LLVM::FCmpPredicate
@@ -232,7 +222,7 @@ struct ElementwiseInlineAsmOpConversion
     SmallVector<Value> packedOperands;
     unsigned numPackedElements = op.getPackedElement();
     for (int i = 0, e = op.getNumOperands(); i < e; i++) {
-      Type elemTy = getElementType(op.getOperand(i));
+      Type elemTy = getElementTypeOrSelf(op.getOperand(i));
       unsigned bitWidth =
           elemTy.isIntOrFloat() ? elemTy.getIntOrFloatBitWidth() : 64;
       unsigned numElementPerReg = std::max(32 / bitWidth, 1u);
@@ -273,10 +263,10 @@ struct ElementwiseInlineAsmOpConversion
     // wrapped in a struct.
     SmallVector<Type> asmRetTypes;
     for (auto result : op.getResult()) {
-      auto ty = getTypeConverter()->convertType(getElementType(result));
+      auto ty = getTypeConverter()->convertType(getElementTypeOrSelf(result));
 
       // Pack return elements into 32-bits.
-      unsigned bitWidth = ty.isIntOrFloat() ? ty.getIntOrFloatBitWidth() : 64;
+      unsigned bitWidth = getIntOrFloatOrPtrBitWidth(ty);
       unsigned numElemsPerReg =
           std::min(std::max(32 / bitWidth, 1u), op.getPackedElement());
       assert(op.getPackedElement() % numElemsPerReg == 0);
@@ -290,20 +280,18 @@ struct ElementwiseInlineAsmOpConversion
     Type asmRetType =
         asmRetTypes.size() > 1 ? struct_ty(asmRetTypes) : asmRetTypes[0];
 
-    Value asmResults =
-        rewriter
-            .create<LLVM::InlineAsmOp>(
-                loc, asmRetType,
-                /*operands=*/packedOperands,
-                /*asm_string=*/op.getAsmString(),
-                /*constraints=*/op.getConstraints(),
-                /*has_side_effects=*/!op.getPure(),
-                /*is_align_stack=*/false, LLVM::TailCallKind::None,
-                /*asm_dialect=*/
-                LLVM::AsmDialectAttr::get(rewriter.getContext(),
-                                          LLVM::AsmDialect::AD_ATT),
-                /*operand_attrs=*/ArrayAttr())
-            ->getResult(0);
+    Value asmResults = LLVM::InlineAsmOp::create(
+                           rewriter, loc, asmRetType,
+                           /*operands=*/packedOperands,
+                           /*asm_string=*/op.getAsmString(),
+                           /*constraints=*/op.getConstraints(),
+                           /*has_side_effects=*/!op.getPure(),
+                           /*is_align_stack=*/false, LLVM::TailCallKind::None,
+                           /*asm_dialect=*/
+                           LLVM::AsmDialectAttr::get(rewriter.getContext(),
+                                                     LLVM::AsmDialect::AD_ATT),
+                           /*operand_attrs=*/ArrayAttr())
+                           ->getResult(0);
 
     // asmResults is a flat struct; pack its values into
     // [return_value][op.getPackedElement()].
@@ -339,7 +327,6 @@ struct ElementwiseInlineAsmOpConversion
     // Layout is unpackedOperands[operand][elem].
     SmallVector<SmallVector<Value>> unpackedOperands;
     for (auto operand : adaptor.getOperands()) {
-      auto argTy = op->getOperand(0).getType();
       auto subOperands = unpackLLElements(loc, operand, rewriter);
       unpackedOperands.push_back(subOperands);
     }
@@ -413,8 +400,8 @@ struct AbsIOpConversion
                                    ConversionPatternRewriter &rewriter,
                                    Type elemTy, MultipleOperandsRange operands,
                                    Location loc) const {
-    return {rewriter.create<LLVM::AbsOp>(loc, elemTy, operands[0][0],
-                                         /*is_int_min_poison=*/false)};
+    return {LLVM::AbsOp::create(rewriter, loc, elemTy, operands[0][0],
+                                /*is_int_min_poison=*/false)};
   }
 };
 
@@ -436,11 +423,11 @@ struct AbsFOpConversion
       assert(num_bits <= 16);
       auto mask = (1u << (num_bits - 1u)) - 1u;
       auto maskAttr = rewriter.getIntegerAttr(elemTy, mask);
-      auto maskConst = rewriter.create<LLVM::ConstantOp>(loc, maskAttr);
+      auto maskConst = LLVM::ConstantOp::create(rewriter, loc, maskAttr);
       return {b.and_(operands[0][0], maskConst)};
     }
 
-    return {rewriter.create<LLVM::FAbsOp>(loc, elemTy, operands[0][0])};
+    return {LLVM::FAbsOp::create(rewriter, loc, elemTy, operands[0][0])};
   }
 };
 
@@ -462,9 +449,9 @@ struct SelectOpConversion
     } else {
       llvmOperands = {operands[0][0], operands[0][1], operands[0][2]};
     }
-    return {rewriter.create<LLVM::SelectOp>(
-        loc, llvmOperands[1].getType(), llvmOperands,
-        adaptor.getAttributes().getValue())};
+    return {LLVM::SelectOp::create(rewriter, loc, llvmOperands[1].getType(),
+                                   llvmOperands,
+                                   adaptor.getAttributes().getValue())};
   }
 };
 template <typename OpTy>
@@ -499,24 +486,24 @@ struct MinMaxFOpConversion
                                    Type elemTy, MultipleOperandsRange operands,
                                    Location loc) const {
     if (hwNanPropagationSupported) {
-      return {rewriter.create<DestOpNanProp>(loc, elemTy, operands[0][0],
-                                             operands[0][1])};
+      return {DestOpNanProp::create(rewriter, loc, elemTy, operands[0][0],
+                                    operands[0][1])};
     }
     // Handle workaround for NaN propagation, i.e. software emulation of NaN
     // propagation. If any of the operands is NaN, return NaN.
     auto lhs = operands[0][0];
     auto rhs = operands[0][1];
     auto lhsIsNan =
-        rewriter.create<LLVM::FCmpOp>(loc, LLVM::FCmpPredicate::une, lhs, lhs);
+        LLVM::FCmpOp::create(rewriter, loc, LLVM::FCmpPredicate::une, lhs, lhs);
     auto rhsIsNan =
-        rewriter.create<LLVM::FCmpOp>(loc, LLVM::FCmpPredicate::une, rhs, rhs);
-    auto isNan = rewriter.create<LLVM::OrOp>(loc, lhsIsNan, rhsIsNan);
-    auto nonNanRes = rewriter.create<DestOpNoNanProp>(loc, elemTy, lhs, rhs);
+        LLVM::FCmpOp::create(rewriter, loc, LLVM::FCmpPredicate::une, rhs, rhs);
+    auto isNan = LLVM::OrOp::create(rewriter, loc, lhsIsNan, rhsIsNan);
+    auto nonNanRes = DestOpNoNanProp::create(rewriter, loc, elemTy, lhs, rhs);
 
     auto nan = LLVM::createNaNConstant(loc, rewriter, elemTy);
 
     // Select the result based on the isNan flag.
-    return {rewriter.create<LLVM::SelectOp>(loc, isNan, nan, nonNanRes)};
+    return {LLVM::SelectOp::create(rewriter, loc, isNan, nan, nonNanRes)};
   }
 
 private:
@@ -543,28 +530,28 @@ struct ClampFOpConversion
     // Clip pattern not found, use min/max.
     if (op.getPropagateNan() == PropagateNan::ALL) {
       if (targetInfo.supportMaximumMinimum()) {
-        auto v = rewriter.create<LLVM::MaximumOp>(loc, elemTy, operands[0][0],
-                                                  operands[0][1]);
-        return {rewriter.create<LLVM::MinimumOp>(loc, v, operands[0][2])};
+        auto v = LLVM::MaximumOp::create(rewriter, loc, elemTy, operands[0][0],
+                                         operands[0][1]);
+        return {LLVM::MinimumOp::create(rewriter, loc, v, operands[0][2])};
       }
       // On pre-80 compute capability, we need to handle NaN propagation
       // manually. We need to check only the first operand for clamp.
       auto lhs = operands[0][0];
-      auto isNan = rewriter.create<LLVM::FCmpOp>(loc, LLVM::FCmpPredicate::une,
-                                                 lhs, lhs);
-      auto v = rewriter.create<LLVM::MaxNumOp>(loc, elemTy, operands[0][0],
-                                               operands[0][1]);
-      auto nonNanRes = rewriter.create<LLVM::MinNumOp>(loc, v, operands[0][2]);
+      auto isNan = LLVM::FCmpOp::create(rewriter, loc, LLVM::FCmpPredicate::une,
+                                        lhs, lhs);
+      auto v = LLVM::MaxNumOp::create(rewriter, loc, elemTy, operands[0][0],
+                                      operands[0][1]);
+      auto nonNanRes = LLVM::MinNumOp::create(rewriter, loc, v, operands[0][2]);
       auto nan = LLVM::createNaNConstant(loc, rewriter, elemTy);
       // Select the result based on the isNan flag.
-      return {rewriter.create<LLVM::SelectOp>(loc, isNan, nan, nonNanRes)};
+      return {LLVM::SelectOp::create(rewriter, loc, isNan, nan, nonNanRes)};
     }
 
     // No NaN propagation.
     assert(op.getPropagateNan() == PropagateNan::NONE);
-    auto v = rewriter.create<LLVM::MaxNumOp>(loc, elemTy, operands[0][0],
-                                             operands[0][1]);
-    return {rewriter.create<LLVM::MinNumOp>(loc, v, operands[0][2])};
+    auto v = LLVM::MaxNumOp::create(rewriter, loc, elemTy, operands[0][0],
+                                    operands[0][1]);
+    return {LLVM::MinNumOp::create(rewriter, loc, v, operands[0][2])};
   }
 
 protected:
@@ -612,7 +599,6 @@ struct MapElementwiseOpConversion
     }
 
     auto &scalarOp = op.getScalarOp();
-    Region &parent = *rewriter.getBlock()->getParent();
 
     auto nOutputs = op.getNumResults();
     SmallVector<Value> scalarOutputs(nOutputs * nElems);
@@ -675,6 +661,7 @@ void mlir::triton::populateElementwiseOpToLLVMPatterns(
   POPULATE_UNARY_OP(arith::ExtUIOp, LLVM::ZExtOp)
   POPULATE_UNARY_OP(arith::FPToUIOp, LLVM::FPToUIOp)
   POPULATE_UNARY_OP(arith::UIToFPOp, LLVM::UIToFPOp)
+  POPULATE_UNARY_OP(arith::NegFOp, LLVM::FNegOp)
   POPULATE_UNARY_OP(math::FloorOp, math::FloorOp)
   POPULATE_UNARY_OP(math::CeilOp, math::CeilOp)
   POPULATE_UNARY_OP(math::LogOp, math::LogOp)

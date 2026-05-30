@@ -22,12 +22,18 @@
  */
 
 #include "triton/Dialect/Triton/IR/Dialect.h"
+#include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/DialectImplementation.h"
 #include "mlir/IR/OpImplementation.h"
 #include "third_party/amd/include/Utils/Utility.h"
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
+#include "triton/Dialect/Triton/IR/Interfaces.h"
+#include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Tools/LayoutUtils.h"
 #include "llvm/ADT/TypeSwitch.h"
+#include "llvm/Support/FormatVariadic.h"
+#include <limits>
 
 // clang-format off
 #include "Dialect/TritonAMDGPU/IR/Dialect.h"
@@ -35,6 +41,7 @@
 // clang-format on
 
 #include "third_party/amd/include/Dialect/TritonAMDGPU/Utility/CommonUtils.h"
+#include "third_party/amd/lib/TritonAMDGPUToLLVM/TDMUtility.h"
 
 using namespace mlir;
 using namespace mlir::triton::amdgpu;
@@ -49,6 +56,8 @@ void mlir::triton::amdgpu::TritonAMDGPUDialect::initialize() {
 #define GET_OP_LIST
 #include "Dialect/TritonAMDGPU/IR/Ops.cpp.inc"
       >();
+
+  addInterfaces<TritonInlinerInterface>();
 }
 
 #include "Dialect/TritonAMDGPU/IR/TritonAMDGPUEnums.cpp.inc"
@@ -58,90 +67,36 @@ void mlir::triton::amdgpu::TritonAMDGPUDialect::initialize() {
 
 #define GET_OP_CLASSES
 #include "Dialect/TritonAMDGPU/IR/Ops.cpp.inc"
+#include "Dialect/TritonAMDGPU/IR/TritonAMDGPUOpInterfaces.cpp.inc"
 
 namespace mlir::triton::amdgpu {
 
-// Check that the source and destination tensor layouts match on a CTA tile.
-// This means that lane and warp bases of linear layout must match, and the
-// register basis must be the same up to a number of registers contained within
-// a CTA tile.
-bool hasMatchingCTATileLayoutForSliceConcat(
-    RankedTensorType srcTy, RankedTensorType dstTy,
-    std::function<void(const Twine &)> emitError) {
-  auto srcShape = srcTy.getShape();
-  auto dstShape = dstTy.getShape();
-  auto srcLL = triton::gpu::toLinearLayout(srcTy);
-  auto dstLL = triton::gpu::toLinearLayout(dstTy);
+namespace {
 
-  MLIRContext *ctx = srcTy.getContext();
-  auto kReg = StringAttr::get(ctx, "register");
-  srcLL = srcLL.removeZeroBasesAlongDim(kReg);
-  dstLL = dstLL.removeZeroBasesAlongDim(kReg);
-
-  auto getBases = [&](StringRef name) {
-    auto key = StringAttr::get(ctx, name);
-    return std::pair{srcLL.getBases().lookup(key),
-                     dstLL.getBases().lookup(key)};
-  };
-
-  auto [regSrc, regDst] = getBases("register");
-  auto [laneSrc, laneDst] = getBases("lane");
-  auto [warpSrc, warpDst] = getBases("warp");
-
-  auto shapeCTASrc = mlir::triton::AMD::getShapePerCTATile(srcTy);
-  auto shapeCTADst = mlir::triton::AMD::getShapePerCTATile(dstTy);
-  if (shapeCTASrc != shapeCTADst) {
-    emitError(
-        "CTA tile shapes must match between source and destination tensors.");
-    return false;
-  }
-
-  // Compute number of basis vectors that desribe registers from one CTA tile.
-  unsigned numCTAs = 1;
-  for (size_t d = 0, rank = srcShape.size(); d < rank; ++d) {
-    assert(srcShape[d] % shapeCTASrc[d] == 0 &&
-           "Source shape must be multiple of CTA tile shape");
-    numCTAs *= srcShape[d] / shapeCTASrc[d];
-  }
-
-  assert(llvm::isPowerOf2_32(numCTAs) &&
-         "expect number of CTAs to be power of 2");
-
-  unsigned totalElemsPerThreadNoBroadcastLog = regSrc.size();
-  unsigned elemsPerThreadPerCTALog =
-      totalElemsPerThreadNoBroadcastLog - llvm::Log2_32(numCTAs);
-  unsigned regCompareLen = elemsPerThreadPerCTALog;
-
-  auto compareBasis = [&](auto &srcBasis, auto &dstBasis, StringRef message,
-                          int limit = -1) {
-    int n = (limit < 0 ? srcBasis.size()
-                       : std::min<unsigned>(srcBasis.size(), limit));
-    if (dstBasis.size() < n) {
-      emitError(message);
-      return false;
-    }
-    for (size_t i = 0; i < n; ++i) {
-      if (srcBasis[i] != dstBasis[i]) {
-        emitError(message);
-        return false;
-      }
-    }
-    return true;
-  };
-
-  if (!compareBasis(regSrc, regDst,
-                    "Register basis must match on a CTA tile between source "
-                    "and destination.",
-                    regCompareLen))
-    return false;
-
-  if (laneSrc != laneDst || warpSrc != warpDst) {
-    emitError("Lane and warp dim basis must match between source and "
-              "destination layout.");
-    return false;
-  }
-  return true;
+std::string getStringFromCoords(mlir::triton::AMD::ElemLocationKey coords) {
+  std::string result;
+  llvm::raw_string_ostream os(result);
+  os << "[";
+  llvm::interleaveComma(coords, os,
+                        [&](const auto &coord) { os << coord.second; });
+  os << "]";
+  return os.str();
 }
+
+// Helper function to verify TDM block dimensions
+LogicalResult verifyTDMBlockSize(Operation *op, ArrayRef<int64_t> blockShape) {
+  constexpr int64_t maxBlockSize = std::numeric_limits<uint16_t>::max();
+  for (size_t i = 0; i < blockShape.size(); ++i) {
+    if (blockShape[i] > maxBlockSize) {
+      return op->emitOpError("TDM block dimension ")
+             << i << " (" << blockShape[i] << ") exceeds maximum size of "
+             << maxBlockSize;
+    }
+  }
+  return success();
+}
+
+} // namespace
 
 LogicalResult ExtractSliceOp::verify() {
   // Basic type/rank checks.
@@ -161,7 +116,6 @@ LogicalResult ExtractSliceOp::verify() {
   auto srcShape = srcTy.getShape();
   auto dstShape = dstTy.getShape();
   auto offsets = getStaticOffsets();
-  auto shapePerCTATile = mlir::triton::AMD::getShapePerCTATile(srcTy);
   size_t rank = srcShape.size();
 
   auto failDim = [&](StringRef msg, int i) -> LogicalResult {
@@ -173,16 +127,59 @@ LogicalResult ExtractSliceOp::verify() {
       return failDim("result shape cannot exceed source shape", i);
     if (offsets[i] + dstShape[i] > srcShape[i])
       return failDim("invalid offset", i);
-    if (dstShape[i] % shapePerCTATile[i] != 0)
-      return emitError("result shape must be multiple of shapePerCTATile");
-    if (offsets[i] % shapePerCTATile[i] != 0)
-      return emitError("offset must be multiple of shapePerCTATile");
   }
 
-  // Verify that source and destination layout match on a CTA tile.
-  if (!hasMatchingCTATileLayoutForSliceConcat(
-          srcTy, dstTy, [&](const Twine &msg) { emitError() << msg; }))
-    return failure();
+  auto linearLayoutSrc = triton::gpu::toLinearLayout(srcTy);
+  auto linearLayoutDst = triton::gpu::toLinearLayout(dstTy);
+  auto ctx = srcTy.getContext();
+
+  auto getBases = [&](StringRef name) {
+    auto key = StringAttr::get(ctx, name);
+    return std::pair{linearLayoutSrc.getBases().lookup(key),
+                     linearLayoutDst.getBases().lookup(key)};
+  };
+
+  StringAttr kReg = StringAttr::get(ctx, "register");
+  auto dstRegBases = linearLayoutDst.getBases().lookup(kReg);
+
+  int dstRegCount = 1 << dstRegBases.size();
+  SmallVector<Value> resultVals;
+
+  // Algorithm:
+  // 1. for every dst register
+  // 2.   get dst element coordinates relative to tile start
+  // 3.   add coordinates of tile start relative to parent tensor
+  // 4.   check if exists source register which holds dst value
+
+  // 1. for every dst register
+  for (int regId = 0; regId < dstRegCount; ++regId) {
+    // 2.   get dst element coordinates relative to tile start
+    auto elemCoords = mlir::triton::AMD::getElemCoordinatesFromRegisters(
+        linearLayoutDst, regId, ctx);
+    // 3.   add coordinates of tile start relative to parent tensor
+
+    for (int i = 0; i < rank; ++i)
+      elemCoords[i].second += offsets[i];
+
+    // 4.   check if exists source register which holds dst value
+    std::optional<int> srcReg = mlir::triton::AMD::getRegFromCoordinates(
+        linearLayoutSrc, elemCoords, ctx);
+
+    if (!srcReg.has_value()) {
+      std::string msg;
+      llvm::raw_string_ostream os(msg);
+      os << "No source register holds the element for destination index "
+         << getStringFromCoords(elemCoords);
+      return emitError(os.str());
+    }
+  }
+
+  auto [laneSrc, laneDst] = getBases("lane");
+  auto [warpSrc, warpDst] = getBases("warp");
+  if (laneSrc != laneDst || warpSrc != warpDst) {
+    return emitError("Lane and warp dim basis must match between source and "
+                     "destination layout.");
+  }
 
   return success();
 }
@@ -191,7 +188,7 @@ LogicalResult ExtractSliceOp::verify() {
 // operations. When extract_slice is used to extract a portion that exactly
 // matches one of the original tensors concatenated by a concat operation, we
 // can eliminate extract_slice op and use the original tensor directly.
-struct CononicalizeExtractSliceAndConcat
+struct CanonicalizeExtractSliceAndConcat
     : public mlir::OpRewritePattern<amdgpu::ExtractSliceOp> {
   using OpRewritePattern::OpRewritePattern;
 
@@ -244,119 +241,7 @@ struct CononicalizeExtractSliceAndConcat
 
 void ExtractSliceOp::getCanonicalizationPatterns(
     mlir::RewritePatternSet &patterns, mlir::MLIRContext *context) {
-  patterns.add<CononicalizeExtractSliceAndConcat>(context);
-}
-
-LogicalResult UpcastMXFPOp::verify() {
-  auto fpType = getFpType();
-
-  auto xTy = getSrc().getType();
-  auto scaleTy = getScale().getType();
-  Builder b(getContext());
-  if (xTy.getElementType() != b.getBF16Type() &&
-      xTy.getElementType() != b.getF16Type() &&
-      xTy.getElementType() != b.getI8Type() &&
-      xTy.getElementType() != b.getType<Float8E4M3FNType>() &&
-      xTy.getElementType() != b.getType<Float8E5M2Type>()) {
-    return emitOpError("element type of the first operand must be bf16/fp16, "
-                       "OCP fp8/bf8 or i8");
-  }
-
-  if (scaleTy.getElementType() != b.getI8Type()) {
-    return emitOpError("element type of the second operand must be uint8");
-  }
-
-  auto xShape = xTy.getShape();
-  auto scaleShape = scaleTy.getShape();
-
-  if (xShape.size() != scaleShape.size() || xShape.size() < 2) {
-    return emitOpError(
-        "operands must have the same number of dimensions, at least 2");
-  }
-
-  if (!(fpType == ScaleDotElemType::E2M1 || fpType == ScaleDotElemType::E4M3 ||
-        fpType == ScaleDotElemType::E5M2)) {
-    return emitOpError("NYI: fpType must be E2M1, E4M3, or E5M2");
-  }
-
-  auto layoutX = xTy.getEncoding();
-  auto layoutScale = scaleTy.getEncoding();
-  if (bool(layoutX) != bool(layoutScale)) {
-    return emitOpError(
-        "Expected either both or neither operands to have an encoding");
-  }
-  // Nothing to check if no encoding. This is used to infer the return type in
-  // AccelerateMatmul.cpp
-  if (!layoutX) {
-    return success();
-  }
-
-  auto dotEncoding = dyn_cast<gpu::DotOperandEncodingAttr>(layoutX);
-  if (!dotEncoding) {
-    return emitOpError("Expected a DotOperandEncodingAttr for values");
-  }
-  if (!isa<gpu::BlockedEncodingAttr, gpu::LinearEncodingAttr>(layoutScale)) {
-    return emitOpError(
-        "Expected a BlockOperandEncoding or LinearOperandEncoding "
-        "for scales");
-  }
-
-  // Change to support fp8 types
-  const auto elemsPacked = fpType == ScaleDotElemType::E2M1 ? 2 : 1;
-  // Figure out the K dimension for the input A/B. For A/B scale, the K
-  // dimension is always the last dimension.
-  const int opIdx = dotEncoding.getOpIdx();
-  const bool hasBatch = xShape.size() == 3;
-  const int kIdx = (opIdx == 0 ? 1 : 0) + hasBatch;
-
-  if (xShape[kIdx] != (32 / elemsPacked) * scaleShape.back()) {
-    return emitOpError("K dimension of first operand must be 16 times "
-                       "larger than last/K dimension of the second operand");
-  }
-
-  // Check other dimensions match too. For input A/B, we need to figure out the
-  // index for the M/N dimension. For scale, it's always {(batch), M/N, K}.
-  const int mnIdx = (opIdx == 0 ? 0 : 1) + hasBatch;
-  if (hasBatch && xShape[0] != scaleShape[0])
-    return emitOpError("batch dimension must match between operands");
-  if (xShape[mnIdx] != scaleShape[hasBatch]) {
-    return emitOpError("M/N dimension must match between operands");
-  }
-
-  return success();
-}
-
-RankedTensorType
-UpcastMXFPOp::deduceOutputType(TypedValue<RankedTensorType> inputTensor,
-                               ScaleDotElemType inputElemType,
-                               Type outputElemType) {
-  MLIRContext *ctx = inputTensor.getContext();
-  auto xTy = inputTensor.getType();
-  if (!(inputElemType == ScaleDotElemType::E2M1 ||
-        inputElemType == ScaleDotElemType::E4M3 ||
-        inputElemType == ScaleDotElemType::E5M2))
-    return xTy;
-
-  auto factor = inputElemType == ScaleDotElemType::E2M1 ? 2 : 1;
-  auto xShape = xTy.getShape();
-  auto newShape = llvm::to_vector(xShape);
-  auto encoding = xTy.getEncoding();
-  if (!encoding) {
-    newShape.back() *= factor;
-    return RankedTensorType::get(xShape, outputElemType);
-  }
-
-  auto oldEncoding = cast<DotOperandEncodingAttr>(encoding);
-  auto newVEncoding = DotOperandEncodingAttr::get(
-      ctx, oldEncoding.getOpIdx(), oldEncoding.getParent(),
-      oldEncoding.getKWidth() * factor);
-  // Figure out the K dimension for the input A/B, given that the return
-  // type is upcasted A/B type so we need to update the proper dim size.
-  const int opIdx = oldEncoding.getOpIdx();
-  const bool hasBatch = xShape.size() == 3;
-  const int kIdx = (opIdx == 0 ? 1 : 0) + hasBatch;
-  newShape[kIdx] *= factor;
-  return RankedTensorType::get(newShape, outputElemType, newVEncoding);
+  patterns.add<CanonicalizeExtractSliceAndConcat>(context);
 }
 
 LogicalResult InThreadTransposeOp::verify() {
@@ -383,8 +268,10 @@ LogicalResult InThreadTransposeOp::verify() {
   auto expectedLinearLayout = deduceOutputLayout(shape, srcEncoding);
   auto dstLinearLayout = triton::gpu::toLinearLayout(dstTy);
   if (dstLinearLayout != expectedLinearLayout) {
-    return emitOpError("Expect output layout to be transposed per thread: " +
-                       expectedLinearLayout.toString());
+    return emitOpError(
+        "Expect output layout to be transposed per thread: " +
+        expectedLinearLayout.toString() +
+        "\nGot following dst layout: " + dstLinearLayout.toString());
   }
   return success();
 }
@@ -399,10 +286,17 @@ InThreadTransposeOp::deduceOutputLayout(ArrayRef<int64_t> shape,
   std::swap(newRegOrder[rank - 2], newRegOrder[rank - 1]);
 
   // Make in-register transposed tile
+  SmallVector<unsigned> sizePerThread{srcEncoding.getSizePerThread()};
+  // Trim sizePerThread to tensor shape,
+  // to ensure deduced layout does not refer to elements outside of tensor
+  for (int i = 0; i < rank; ++i) {
+    sizePerThread[i] =
+        std::min(sizePerThread[i], static_cast<unsigned>(shape[i]));
+  }
   auto ctx = srcEncoding.getContext();
   auto regDimName = StringAttr::get(ctx, "register");
-  auto inThreadTransposedTile = identityStandardND(
-      regDimName, srcEncoding.getSizePerThread(), newRegOrder);
+  auto inThreadTransposedTile =
+      identityStandardND(regDimName, sizePerThread, newRegOrder);
   // make sure basis in same order as in srcLayout
   SmallVector<StringAttr> outDimNames(srcLL.getOutDimNames());
   inThreadTransposedTile = inThreadTransposedTile.transposeOuts(outDimNames);
@@ -410,12 +304,94 @@ InThreadTransposeOp::deduceOutputLayout(ArrayRef<int64_t> shape,
   // Copy original bases, and replace register tile with transposed one
   LinearLayout::BasesT bases = srcLL.getBases();
   auto &regBase = *bases.find(regDimName);
-  int regsTransposed = inThreadTransposedTile.getInDimSizeLog2(regDimName);
-  for (int i = 0; i < regsTransposed; ++i)
-    regBase.second[i] = inThreadTransposedTile.getBasis(regDimName, i);
+  int regBasesTransposed = inThreadTransposedTile.getInDimSizeLog2(regDimName);
+  for (int baseIdx = 0; baseIdx < regBasesTransposed; ++baseIdx)
+    regBase.second[baseIdx] =
+        inThreadTransposedTile.getBasis(regDimName, baseIdx);
+  int regBasesInTile = llvm::Log2_32(product(srcEncoding.getSizePerThread()));
+  for (int baseIdx = regBasesTransposed; baseIdx < regBasesInTile; ++baseIdx)
+    llvm::for_each(regBase.second[baseIdx], [](int32_t &val) { val = 0; });
 
   LinearLayout transposedLL(bases, SmallVector<StringAttr>(outDimNames));
   return transposedLL;
+}
+
+LogicalResult ScaledUpcastFp4Op::verify() {
+  RankedTensorType inputTy = getInput().getType();
+  RankedTensorType outputTy = getOutput().getType();
+  RankedTensorType scaleTy = getScale().getType();
+  auto scaleEnc = scaleTy.getEncoding();
+  auto outputEnc = outputTy.getEncoding();
+
+  if (outputTy.getShape() != scaleTy.getShape())
+    return emitError() << "scale and output should have the same shape";
+
+  if (bool(scaleEnc) != bool(outputEnc))
+    return emitError()
+           << "scale and output must both have an encoding, or neither";
+
+  if (scaleEnc && !mlir::triton::gpu::areLayoutsEquivalent(
+                      outputTy.getShape(),
+                      cast<mlir::triton::gpu::LayoutEncodingTrait>(scaleEnc),
+                      cast<mlir::triton::gpu::LayoutEncodingTrait>(outputEnc)))
+    return emitError() << "scale and output encodings are not compatible:\n"
+                       << mlir::triton::gpu::toLinearLayout(outputTy).toString()
+                       << "\n"
+                       << mlir::triton::gpu::toLinearLayout(scaleTy).toString();
+
+  return mlir::triton::gpu::Fp4ToFpOp::verifyFp4ToFp(*this, inputTy, outputTy,
+                                                     getAxis());
+}
+
+Attribute ScaledUpcastFp4Op::inferDstEncoding(unsigned opIdx,
+                                              Attribute srcEnc) {
+  // The layout of scale is the same as that of the result
+  if (opIdx == 1)
+    return srcEnc;
+  Attribute dstEnc;
+  auto shape = getOutput().getType().getShape();
+
+  auto iface =
+      srcEnc.getDialect()
+          .getRegisteredInterface<triton::DialectInferLayoutInterface>();
+  // Given the fp4 operand is packed, we can reuse the infer utility of
+  // Fp4ToFpOp
+  auto result =
+      iface->inferFp4ToFpOpEncoding(shape, getAxis(), srcEnc, dstEnc,
+                                    /*fwdInference*/ true, std::nullopt);
+  assert(succeeded(result));
+  return dstEnc;
+}
+
+Attribute ScaledUpcastFp4Op::inferSrcEncoding(unsigned opIdx,
+                                              Attribute dstEnc) {
+  // The layout of scale is the same as that of the result
+  if (opIdx == 1)
+    return dstEnc;
+  Attribute srcEnc;
+  auto shape = getOutput().getType().getShape();
+
+  auto iface =
+      dstEnc.getDialect()
+          .getRegisteredInterface<triton::DialectInferLayoutInterface>();
+  // Given the fp4 operand is packed, we can reuse the infer utility of
+  // Fp4ToFpOp
+  if (succeeded(iface->inferFp4ToFpOpEncoding(shape, getAxis(), dstEnc, srcEnc,
+                                              /*fwdInference*/ false,
+                                              std::nullopt))) {
+    return srcEnc;
+  }
+  return {};
+}
+
+Attribute ScaledUpcastFp8Op::inferDstEncoding(unsigned opIdx,
+                                              Attribute srcEnc) {
+  return srcEnc;
+}
+
+Attribute ScaledUpcastFp8Op::inferSrcEncoding(unsigned opIdx,
+                                              Attribute dstEnc) {
+  return dstEnc;
 }
 
 LogicalResult ConcatOp::verify() {
@@ -457,12 +433,80 @@ LogicalResult ConcatOp::verify() {
     return emitError()
            << "Element types of sources and destination must match.";
 
-  // 3) Check that all source and destination layouts match on a CTA tile.
-  if (!hasMatchingCTATileLayoutForSliceConcat(
-          srcType, dstType, [&](const Twine &msg) { emitError() << msg; }))
-    return failure();
+  auto linearLayoutSrc = triton::gpu::toLinearLayout(srcType);
+  auto linearLayoutDst = triton::gpu::toLinearLayout(dstType);
+  auto ctx = srcType.getContext();
+
+  auto getBases = [&](StringRef name) {
+    auto key = StringAttr::get(ctx, name);
+    return std::pair{linearLayoutSrc.getBases().lookup(key),
+                     linearLayoutDst.getBases().lookup(key)};
+  };
+
+  auto srcToDstShape = LLVM::AMD::multiDimElementwise<int64_t, int64_t>(
+      dstShape, srcShape, std::divides<unsigned>());
+  std::vector<unsigned> defaultOrder(rank);
+  std::iota(defaultOrder.rbegin(), defaultOrder.rend(), 0);
+
+  StringAttr kReg = StringAttr::get(ctx, "register");
+  auto dstRegBases = linearLayoutDst.getBases().lookup(kReg);
+  int dstRegCount = 1 << dstRegBases.size();
+
+  // Algorithm:
+  // 1. for all elements in dst tensor
+  // 2.   get dst value location in tensor
+  // 3.   find, which input tile holds the dst value
+  // 4.   subtract dst coordinates and start coordinates of the tile
+  // 5.   check if exist source register which holds dst value
+
+  // 1. for all elements in dst tensor
+  for (int regId = 0; regId < dstRegCount; ++regId) {
+    // 2.   get dst value location in tensor
+    auto elemCoords = mlir::triton::AMD::getElemCoordinatesFromRegisters(
+        linearLayoutDst, regId, ctx);
+    auto elemCoordsArray = llvm::to_vector(llvm::make_second_range(elemCoords));
+
+    // 3.   find, which input tile holds the dst value
+    auto multiDimOperandIdx = LLVM::AMD::multiDimElementwise<int32_t, int64_t>(
+        elemCoordsArray, srcShape, std::divides<unsigned>());
+
+    // 4.   subtract dst coordinates and start coordinates of the tile
+
+    for (int dim = 0; dim < rank; ++dim)
+      elemCoords[dim].second -= multiDimOperandIdx[dim] * srcShape[dim];
+
+    std::optional<int> srcReg = mlir::triton::AMD::getRegFromCoordinates(
+        linearLayoutSrc, elemCoords, ctx);
+    // 5.   check if exist source register which holds dst value
+
+    if (!srcReg.has_value()) {
+      auto coordsStr = getStringFromCoords(elemCoords);
+      std::string msg =
+          "No source register holds the element for destination index " +
+          coordsStr;
+      return emitError(msg);
+    }
+  }
+
+  auto [laneSrc, laneDst] = getBases("lane");
+  auto [warpSrc, warpDst] = getBases("warp");
+  if (laneSrc != laneDst || warpSrc != warpDst) {
+    return emitError("Lane and warp dim basis must match between source and "
+                     "destination layout.");
+  }
 
   return success();
+}
+
+LogicalResult BufferLoadToLocalOp::verify() {
+  auto mod = getOperation()->getParentOfType<ModuleOp>();
+  if (!mod)
+    return success();
+
+  TargetFeatures features = TargetFeatures::fromModuleOp(mod);
+  if (features.getArch().empty() || features.supportsBufferLoadToLocal())
+    return success();
+  return emitError() << "BufferLoadToLocal unsupported on target architecture";
 }
 
 LogicalResult LocalLoadPackedTransposedOp::verify() {
@@ -522,8 +566,8 @@ LogicalResult LocalLoadPackedTransposedOp::verify() {
 
 // This pattern removes a concatOp if it has a single input operand.
 // This scenario can potentially happen as a result of ops refinement.
-mlir::LogicalResult foldConcatOpFromSingleSource(amdgpu::ConcatOp op,
-                                                 PatternRewriter &rewriter) {
+static mlir::LogicalResult
+foldConcatOpFromSingleSource(amdgpu::ConcatOp op, PatternRewriter &rewriter) {
   auto sources = op.getSources();
   if (sources.size() == 1) {
     auto source = sources.front();
@@ -537,6 +581,555 @@ mlir::LogicalResult foldConcatOpFromSingleSource(amdgpu::ConcatOp op,
 void ConcatOp::getCanonicalizationPatterns(mlir::RewritePatternSet &patterns,
                                            mlir::MLIRContext *context) {
   patterns.add(foldConcatOpFromSingleSource);
+}
+
+namespace {
+// Validate `warp_used_hint` against the axis-aligned hint rule (see
+// TritonAMDGPUOps.td).  Encoding-specific rules (e.g.
+// PartitionedSharedEncoding) live in verify() since they need the result type.
+LogicalResult validateWarpUsedHint(AsyncTDMCopyGlobalToLocalOp op,
+                                   uint32_t hint, int64_t numWarps) {
+  if (!llvm::isPowerOf2_64(numWarps))
+    return op.emitOpError("num_warps must be a power of two when using "
+                          "warp_used_hint, got ")
+           << numWarps;
+
+  if (numWarps >= 32)
+    return op.emitOpError("num_warps must be less than 32 when using "
+                          "warp_used_hint, got ")
+           << numWarps;
+
+  if (hint == 0)
+    return op.emitOpError("warp_used_hint must have at least one bit set");
+
+  // Bits above num_warps - 1 must be zero (no warp at those positions).
+  uint32_t numWarpsMask = (uint32_t{1} << numWarps) - 1;
+  if ((hint & ~numWarpsMask) != 0)
+    return op.emitOpError("warp_used_hint = ")
+           << llvm::formatv("{0:x}", hint)
+           << " sets bits beyond num_warps = " << numWarps;
+
+  unsigned K = llvm::popcount(hint);
+  if (!llvm::isPowerOf2_32(K))
+    return op.emitOpError("popcount(warp_used_hint) = ")
+           << K << " must be a power of two (got hint "
+           << llvm::formatv("{0:x}", hint) << ")";
+
+  // Axis-aligned check.  Anchor at i0 = lsb(hint) and OR the shifted
+  // warp indices: `support` is the bits that vary across the active
+  // set.  Legal iff popcount(support) == log2(K) -- pigeonhole forces
+  // the K shifted indices to hit every subset of `support`, i.e. the
+  // active set is selectable by a single mask check.
+  unsigned i0 = llvm::countr_zero(hint);
+  uint32_t support = 0;
+  for (uint32_t mask = hint; mask != 0; mask &= mask - 1) {
+    unsigned w = llvm::countr_zero(mask);
+    support |= static_cast<uint32_t>(w ^ i0);
+  }
+  unsigned logK = llvm::Log2_32(K);
+  unsigned spanned = static_cast<unsigned>(llvm::popcount(support));
+  if (spanned != logK)
+    return op.emitOpError("warp_used_hint = ")
+           << llvm::formatv("{0:x}", hint) << " is not axis-aligned: K = " << K
+           << " active warps span " << spanned
+           << " warpId bit positions, but an axis-aligned hint "
+           << "spans exactly log2(K) = " << logK;
+
+  return success();
+}
+} // namespace
+
+LogicalResult AsyncTDMCopyGlobalToLocalOp::verify() {
+  auto tensorDescTy = getDesc().getType();
+  auto smemTy = getResult().getType();
+
+  // Check that every dimension of the block shape is <= 2^16
+  auto blockShape = tensorDescTy.getShape();
+  auto verifyResult = verifyTDMBlockSize(getOperation(), blockShape);
+  if (failed(verifyResult))
+    return verifyResult;
+
+  if (tensorDescTy.getSharedLayout() != smemTy.getEncoding())
+    return emitOpError(
+        "Mismatch between TDM descriptor and destination smem encodings");
+
+  auto swizzledEnc =
+      llvm::dyn_cast<gpu::SwizzledSharedEncodingAttr>(smemTy.getEncoding());
+  if (swizzledEnc && swizzledEnc.getMaxPhase() != 1)
+    return emitOpError("TDM does not support swizzling");
+
+  auto paddedEnc =
+      llvm::dyn_cast<gpu::PaddedSharedEncodingAttr>(smemTy.getEncoding());
+
+  // Check for PartitionedSharedEncodingAttr and validate its inner layout
+  auto partitionedEnc =
+      llvm::dyn_cast<gpu::PartitionedSharedEncodingAttr>(smemTy.getEncoding());
+  if (partitionedEnc) {
+    auto partitionLayout = partitionedEnc.getPartitionLayout();
+    auto innerSwizzled =
+        llvm::dyn_cast<gpu::SwizzledSharedEncodingAttr>(partitionLayout);
+    if (innerSwizzled && innerSwizzled.getMaxPhase() != 1)
+      return emitOpError(
+          "TDM does not support swizzling in partitioned layout");
+
+    auto innerPadded =
+        llvm::dyn_cast<gpu::PaddedSharedEncodingAttr>(partitionLayout);
+    if (!innerPadded && !innerSwizzled)
+      return emitOpError(
+          "Invalid inner layout for partitioned shared memory in TDM");
+  }
+
+  if (!paddedEnc && !swizzledEnc && !partitionedEnc)
+    return emitOpError("Invalid shared memory layout for TDM");
+
+  Type elementType = smemTy.getElementType();
+  auto elementBitWidth = elementType.getIntOrFloatBitWidth();
+  if (paddedEnc) {
+    auto descPaddedEnc = llvm::dyn_cast_or_null<gpu::PaddedSharedEncodingAttr>(
+        tensorDescTy.getBlockType().getEncoding());
+    if (descPaddedEnc &&
+        descPaddedEnc.getIntervals() != paddedEnc.getIntervals() &&
+        descPaddedEnc.getPaddings() != paddedEnc.getPaddings()) {
+      return emitOpError(
+          "Interval/Padding mismatch between descriptor and allocation");
+    }
+    unsigned dwordSize = 32;
+    for (auto [interval, padding] :
+         llvm::zip(paddedEnc.getIntervals(), paddedEnc.getPaddings())) {
+      auto intervalInDwords = interval * elementBitWidth / dwordSize;
+      if (intervalInDwords < 2)
+        return emitOpError("TDM padding interval must be at least 2 dwords");
+
+      auto paddingInDwords = padding * elementBitWidth / dwordSize;
+      if (paddingInDwords < 1)
+        return emitOpError("TDM padding amount must be at least 1 dword");
+    }
+  }
+
+  if (auto warpUsedHintAttr = getWarpUsedHintAttr()) {
+    int numWarps = gpu::lookupNumWarps(*this);
+    uint32_t hint = static_cast<uint32_t>(warpUsedHintAttr.getInt());
+    if (failed(validateWarpUsedHint(*this, hint, numWarps)))
+      return failure();
+
+    // PartitionedSharedEncoding: hinted path = single instruction, so
+    // numLogicalPieces must divide K (equivalent to K >= numLogicalPieces
+    // since K is a power of two).
+    if (partitionedEnc) {
+      unsigned partitionDim = partitionedEnc.getPartitionDim();
+      unsigned numLogicalPieces = partitionedEnc.getNumLogicalPieces();
+      assert(numLogicalPieces > 0 &&
+             "PartitionedSharedEncoding must have numLogicalPieces >= 1");
+      unsigned K = llvm::popcount(hint);
+      if (K % numLogicalPieces != 0)
+        return emitOpError(
+                   "warp_used_hint with a partitioned shared encoding must "
+                   "select K active warps such that numLogicalPieces divides "
+                   "K so the copy fits in a single TDM instruction (got K = ")
+               << K << ", numLogicalPieces = " << numLogicalPieces
+               << ", partitionDim = " << partitionDim << ")";
+    }
+  }
+
+  return success();
+}
+
+// -- AsyncCopyLocalToGlobalOp --
+LogicalResult AsyncCopyLocalToGlobalOp::verify() {
+  // Verify the source is local memory (shared memory)
+  auto srcTy = getSrc().getType();
+  if (!isa<gpu::SharedMemorySpaceAttr>(srcTy.getMemorySpace()))
+    return emitOpError("source must be in shared memory");
+
+  return success();
+}
+
+LogicalResult AsyncTDMCopyLocalToGlobalOp::verify() {
+  auto tensorDescTy = getDesc().getType();
+  auto smemTy = getSrc().getType();
+
+  // Check that every dimension of the block shape is <= 2^16
+  auto blockShape = tensorDescTy.getShape();
+  auto verifyResult = verifyTDMBlockSize(getOperation(), blockShape);
+  if (failed(verifyResult))
+    return verifyResult;
+
+  if (tensorDescTy.getSharedLayout() != smemTy.getEncoding())
+    return emitOpError(
+        "Mismatch between TDM descriptor and source smem encodings");
+
+  auto swizzledEnc =
+      llvm::dyn_cast<gpu::SwizzledSharedEncodingAttr>(smemTy.getEncoding());
+  if (swizzledEnc && swizzledEnc.getMaxPhase() != 1)
+    return emitOpError("TDM does not support swizzling");
+
+  auto paddedEnc =
+      llvm::dyn_cast<gpu::PaddedSharedEncodingAttr>(smemTy.getEncoding());
+  if (paddedEnc) {
+    // Check if descriptor has a compatible padded encoding
+    auto descPaddedEnc = llvm::dyn_cast_or_null<gpu::PaddedSharedEncodingAttr>(
+        tensorDescTy.getBlockType().getEncoding());
+    if (descPaddedEnc &&
+        descPaddedEnc.getIntervals() != paddedEnc.getIntervals() &&
+        descPaddedEnc.getPaddings() != paddedEnc.getPaddings()) {
+      return emitOpError(
+          "Interval/Padding mismatch between descriptor and allocation");
+    }
+    // Check if we can apply the padding workaround, see the lowering to LLVM
+    // for more details.
+    auto intervals = paddedEnc.getIntervals();
+    if (intervals.size() != 1)
+      return emitOpError("TDM store only supports single interval paddings.");
+
+    auto shapePerCTA = triton::gpu::getShapePerCTA(paddedEnc, blockShape);
+    if (intervals[0] != shapePerCTA.back())
+      return emitOpError("TDM store padding is only supported when padding "
+                         "interval equals the innermost block dimension (got "
+                         "padInterval=")
+             << intervals[0] << ", innermost dimension=" << blockShape.back()
+             << ")";
+  }
+
+  if (!paddedEnc && !swizzledEnc)
+    return emitOpError("Invalid shared memory layout for TDM");
+
+  return success();
+}
+
+LogicalResult AsyncTDMScatterOp::verify() {
+  auto tensorDescTy = getDesc().getType();
+  auto smemTy = getSrc().getType();
+
+  // TDM scatter mode only supports 2D tensors
+  auto blockShape = tensorDescTy.getShape();
+  if (blockShape.size() != 2)
+    return emitOpError("TDM scatter only supports 2D tensors, got ")
+           << blockShape.size() << "D";
+
+  // Check that every dimension of the block shape is <= 2^16
+  auto verifyResult = verifyTDMBlockSize(getOperation(), blockShape);
+  if (failed(verifyResult))
+    return verifyResult;
+
+  auto dstRowIndicesType = cast<RankedTensorType>(getDstRowIndices().getType());
+  if (dstRowIndicesType.getRank() != 1)
+    return emitOpError("dst_row_indices must be a 1D tensor");
+
+  // Element type (i16 or i32) is already verified by ODS constraint
+  // TensorOf<[I16, I32]>
+
+  int64_t numIndices = dstRowIndicesType.getShape()[0];
+  if (!llvm::isPowerOf2_64(numIndices))
+    return emitOpError("dst_row_indices size must be a power of 2, got ")
+           << numIndices;
+
+  auto swizzledEnc =
+      llvm::dyn_cast<gpu::SwizzledSharedEncodingAttr>(smemTy.getEncoding());
+  if (swizzledEnc && swizzledEnc.getMaxPhase() != 1)
+    return emitOpError("TDM does not support swizzling");
+
+  auto paddedEnc =
+      llvm::dyn_cast<gpu::PaddedSharedEncodingAttr>(smemTy.getEncoding());
+  if (paddedEnc) {
+    // Check if we can apply the padding workaround, see the lowering to LLVM
+    // for more details.
+    auto intervals = paddedEnc.getIntervals();
+    if (intervals.size() != 1)
+      return emitOpError("TDM scatter only supports single interval paddings.");
+
+    if (intervals[0] != blockShape.back())
+      return emitOpError("TDM scatter padding is only supported when padding "
+                         "interval equals the innermost block dimension (got "
+                         "padInterval=")
+             << intervals[0] << ", innermost dimension=" << blockShape.back()
+             << ")";
+  }
+
+  if (!paddedEnc && !swizzledEnc)
+    return emitOpError("Invalid shared memory layout for TDM");
+
+  return success();
+}
+
+LogicalResult AsyncTDMGatherOp::verify() {
+  auto tensorDescTy = getDesc().getType();
+  auto smemTy = getDst().getType();
+
+  // TDM gather mode only supports 2D tensors
+  auto blockShape = tensorDescTy.getShape();
+  if (blockShape.size() != 2)
+    return emitOpError("TDM gather only supports 2D tensors, got ")
+           << blockShape.size() << "D";
+
+  // Check that every dimension of the block shape is <= 2^16
+  auto verifyResult = verifyTDMBlockSize(getOperation(), blockShape);
+  if (failed(verifyResult))
+    return verifyResult;
+
+  auto srcRowIndicesType = cast<RankedTensorType>(getSrcRowIndices().getType());
+  if (srcRowIndicesType.getRank() != 1)
+    return emitOpError("src_row_indices must be a 1D tensor");
+
+  // Element type (i16 or i32) is already verified by ODS constraint
+  // TensorOf<[I16, I32]>
+
+  int64_t numIndices = srcRowIndicesType.getShape()[0];
+  if (!llvm::isPowerOf2_64(numIndices))
+    return emitOpError("src_row_indices size must be a power of 2, got ")
+           << numIndices;
+
+  auto swizzledEnc =
+      llvm::dyn_cast<gpu::SwizzledSharedEncodingAttr>(smemTy.getEncoding());
+  if (swizzledEnc && swizzledEnc.getMaxPhase() != 1)
+    return emitOpError("TDM does not support swizzling");
+
+  auto paddedEnc =
+      llvm::dyn_cast<gpu::PaddedSharedEncodingAttr>(smemTy.getEncoding());
+  if (paddedEnc && !(paddedEnc.getIntervals().size() == 1 &&
+                     paddedEnc.getPaddings().size() == 1))
+    return emitOpError(
+        "TDM gather does not support multiple interval-padding pairs");
+
+  if (!paddedEnc && !swizzledEnc)
+    return emitOpError("Invalid shared memory layout for TDM");
+
+  auto shapePerCTA = triton::gpu::getShapePerCTA(smemTy);
+  auto sharedOrder = triton::gpu::getOrder(
+      cast<triton::gpu::SharedEncodingTrait>(smemTy.getEncoding()),
+      shapePerCTA);
+  if (sharedOrder[0] != (sharedOrder.size() - 1))
+    return emitOpError("TDM gather only supports row-major shared order");
+
+  // TDM gather reads the descriptor from SGPRs — all lanes in a warp see
+  // the same descriptor. The index layout must broadcast the same values
+  // to all lanes (all lane bits must be free).
+  if (srcRowIndicesType.getEncoding()) {
+    auto indexLL = triton::gpu::toLinearLayout(srcRowIndicesType);
+    auto kLane = mlir::StringAttr::get(getContext(), "lane");
+    auto freeVarMasks = indexLL.getFreeVariableMasks();
+    unsigned laneFreeMask = freeVarMasks.lookup(kLane);
+    unsigned numLanes = indexLL.getInDimSize(kLane);
+    if (laneFreeMask != (numLanes - 1))
+      return emitOpError(
+          "index layout distributes values across lanes, which is "
+          "incompatible with the warp-level TDM instruction. Change layout "
+          "to broadcast the same indices to all lanes in a warp.");
+  }
+
+  return success();
+}
+
+// -- UpdateTensorDescriptorOp --
+LogicalResult UpdateTensorDescriptorOp::verify() {
+  auto descTy = getDesc().getType();
+  size_t rank = descTy.getShape().size();
+
+  if (!getAddOffsets().empty() && getAddOffsets().size() != rank)
+    return emitOpError("expected ")
+           << rank << " add_offsets to match descriptor rank, got "
+           << getAddOffsets().size();
+
+  if (!getSetBounds().empty() && getSetBounds().size() != rank)
+    return emitOpError("expected ")
+           << rank << " set_bounds to match descriptor rank, got "
+           << getSetBounds().size();
+
+  // At least one mutation parameter must be provided -- a no-op update is
+  // either a user mistake or should be folded by canonicalizer.
+  if (getAddOffsets().empty() && getSetBounds().empty() && !getDest() &&
+      !getPred() && !getBarrier())
+    return emitOpError("must provide at least one of add_offsets, set_bounds, "
+                       "dest, pred, or barrier");
+
+  return success();
+}
+
+// -- InitBarrierOp --
+LogicalResult InitBarrierOp::verify() {
+  if (failed(verifyBarrierType(*this, getAlloc().getType())))
+    return failure();
+  if (getCount() < 1)
+    return emitOpError("count must be greater than or equal to 1");
+  return success();
+}
+
+TypedValue<gpu::MemDescType> InitBarrierOp::getBarrier() { return getAlloc(); }
+
+// -- WaitBarrierOp --
+LogicalResult WaitBarrierOp::verify() {
+  if (failed(verifyBarrierType(*this, getAlloc().getType())))
+    return failure();
+  return success();
+}
+
+TypedValue<gpu::MemDescType> WaitBarrierOp::getBarrier() { return getAlloc(); }
+
+// -- ArriveBarrierOp --
+LogicalResult ArriveBarrierOp::verify() {
+  if (failed(verifyBarrierType(*this, getAlloc().getType())))
+    return failure();
+  if (getCount() < 1)
+    return emitOpError("count must be greater than or equal to 1");
+  return success();
+}
+
+TypedValue<gpu::MemDescType> ArriveBarrierOp::getBarrier() {
+  return getAlloc();
+}
+
+// -- AsyncCopyMbarrierArriveOp --
+LogicalResult AsyncCopyMbarrierArriveOp::verify() {
+  if (failed(verifyBarrierType(*this, getBarrier().getType())))
+    return failure();
+  return success();
+}
+
+// -- TDMPrefetchOp --
+// This op optionally returns the prefetch offsets (testing-only). When
+// `returnOffsets` is absent, it produces no results. When present, it yields an
+// int64 tensor of the prefetch addresses relative to the tensor base. The
+// tensor shape is:
+//   [num_programs, block_shape[:-1], block_shape[-1] / elements_per_prefetch]
+// i.e., the last dimension is scaled by how many elements fit in one 256-byte
+// prefetch. Values are the byte offsets added to the base pointer for each
+// prefetch instruction.
+LogicalResult TDMPrefetchOp::inferReturnTypes(
+    MLIRContext *context, std::optional<Location> location, ValueRange operands,
+    DictionaryAttr attributes, PropertyRef properties, RegionRange regions,
+    SmallVectorImpl<Type> &inferredReturnTypes) {
+  TDMPrefetchOp::Adaptor ad(operands, attributes, properties, regions);
+
+  // If returnOffsets is not set the op will not return any results
+  if (!ad.getReturnOffsets().has_value()) {
+    return success();
+  }
+
+  auto descType = cast<triton::TensorDescType>(ad.getDesc().getType());
+  auto blockShape = descType.getShape();
+  auto elementType = descType.getElementType();
+
+  // Lookup the module to get the number of threads per warp, number of warps
+  // and number of CTAs
+  ModuleOp mod;
+  for (auto operand : operands) {
+    if (auto op = operand.getDefiningOp()) {
+      mod = op->getParentOfType<ModuleOp>();
+      break;
+    } else if (auto blockArg = dyn_cast<BlockArgument>(operand)) {
+      auto parentOp = blockArg.getOwner()->getParentOp();
+      if (parentOp) {
+        mod = parentOp->getParentOfType<ModuleOp>();
+        break;
+      }
+    }
+  }
+  assert(mod);
+
+  auto threadsPerWarp = triton::gpu::TritonGPUDialect::getThreadsPerWarp(mod);
+  auto numWarps = triton::gpu::lookupNumWarps(mod);
+  auto numCTAs = triton::gpu::TritonGPUDialect::getNumCTAs(mod);
+
+  // Prefetches 256 bytes into L2
+  const int bytesPerPrefetch = 256;
+  int elemPerPrefetch =
+      (bytesPerPrefetch * 8) / elementType.getIntOrFloatBitWidth();
+
+  // Scale the block shape by the number of elements per prefetch
+  SmallVector<int64_t> scaledBlockShape(blockShape.begin(), blockShape.end());
+  scaledBlockShape.back() =
+      ceil<int64_t>(scaledBlockShape.back(), elemPerPrefetch);
+
+  // Use the default blocked encoding to unroll the TDM tile
+  auto enc = triton::gpu::getDefaultBlockedEncoding(
+      context, scaledBlockShape, numWarps, threadsPerWarp, numCTAs);
+  IntegerType i64Type = IntegerType::get(context, 64);
+  auto tensorTy = RankedTensorType::get(scaledBlockShape, i64Type, enc);
+
+  inferredReturnTypes.push_back(tensorTy);
+
+  return success();
+}
+
+// -- ClusterBarrierSignalOp --
+LogicalResult ClusterBarrierArriveOp::verify() {
+  int numCTAs = triton::gpu::lookupNumCTAs(getOperation());
+  if (numCTAs <= 1)
+    return emitOpError("requires ttg.num-ctas > 1");
+  return success();
+}
+
+// -- ClusterBarrierWaitOp --
+LogicalResult ClusterBarrierWaitOp::verify() {
+  int numCTAs = triton::gpu::lookupNumCTAs(getOperation());
+  if (numCTAs <= 1)
+    return emitOpError("requires ttg.num-ctas > 1");
+  return success();
+}
+
+// -- PredicatedOpInterface implementations --
+
+Value BufferLoadOp::getPredicateOperand() { return getMask(); }
+void BufferLoadOp::setPredicateOperand(Value pred) {
+  getMaskMutable().assign(pred);
+}
+Type BufferLoadOp::getPredicateOperandTypeLike() {
+  return getOffsets().getType();
+}
+
+Value BufferLoadToLocalOp::getPredicateOperand() { return getMask(); }
+void BufferLoadToLocalOp::setPredicateOperand(Value pred) {
+  getMaskMutable().assign(pred);
+}
+Type BufferLoadToLocalOp::getPredicateOperandTypeLike() {
+  return getOffsets().getType();
+}
+
+Value BufferAtomicRMWOp::getPredicateOperand() { return getMask(); }
+void BufferAtomicRMWOp::setPredicateOperand(Value pred) {
+  getMaskMutable().assign(pred);
+}
+Type BufferAtomicRMWOp::getPredicateOperandTypeLike() {
+  return getOffsets().getType();
+}
+
+Value BufferStoreOp::getPredicateOperand() { return getMask(); }
+void BufferStoreOp::setPredicateOperand(Value pred) {
+  getMaskMutable().assign(pred);
+}
+Type BufferStoreOp::getPredicateOperandTypeLike() {
+  return getOffsets().getType();
+}
+
+Value AsyncCopyLocalToGlobalOp::getPredicateOperand() { return getMask(); }
+void AsyncCopyLocalToGlobalOp::setPredicateOperand(Value pred) {
+  getMaskMutable().assign(pred);
+}
+Type AsyncCopyLocalToGlobalOp::getPredicateOperandTypeLike() {
+  return getDst().getType();
+}
+
+Value AsyncTDMCopyGlobalToLocalOp::getPredicateOperand() { return getPred(); }
+void AsyncTDMCopyGlobalToLocalOp::setPredicateOperand(Value pred) {
+  getPredMutable().assign(pred);
+}
+Type AsyncTDMCopyGlobalToLocalOp::getPredicateOperandTypeLike() {
+  return getPred().getType();
+}
+
+Value AsyncTDMGatherOp::getPredicateOperand() { return getPred(); }
+void AsyncTDMGatherOp::setPredicateOperand(Value pred) {
+  getPredMutable().assign(pred);
+}
+Type AsyncTDMGatherOp::getPredicateOperandTypeLike() {
+  return getPred().getType();
+}
+
+Value TDMPrefetchOp::getPredicateOperand() { return getPred(); }
+void TDMPrefetchOp::setPredicateOperand(Value pred) {
+  getPredMutable().assign(pred);
+}
+Type TDMPrefetchOp::getPredicateOperandTypeLike() {
+  return IntegerType::get(getContext(), 1);
 }
 
 } // namespace mlir::triton::amdgpu

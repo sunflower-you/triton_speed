@@ -1,3 +1,4 @@
+import inspect
 import subprocess
 import tempfile
 
@@ -6,7 +7,8 @@ import torch
 
 import triton
 import triton.language as tl
-from triton._internal_testing import is_interpreter
+from triton._internal_testing import is_hopper_or_newer, is_interpreter
+from triton._filecheck import run_filecheck
 
 
 @triton.jit
@@ -41,7 +43,7 @@ def kernel_call_noinline(X, Y, BLOCK: tl.constexpr):
 
 @triton.autotune(
     configs=[
-        triton.Config({"BLOCK": 128}, num_warps=4),
+        triton.Config({"BLOCK": 64}, num_warps=4),
     ],
     key=[],
 )
@@ -156,24 +158,24 @@ def test_line_info(func: str):
 
     file_lines = extract_file_lines(command, anchor, separator, kernel_info.asm[obj_kind])
     if func == "single":
-        assert (check_file_lines(file_lines, "test_line_info.py", 14))
-        assert (check_file_lines(file_lines, "test_line_info.py", 15))
+        assert (check_file_lines(file_lines, "test_line_info.py", 16))
+        assert (check_file_lines(file_lines, "test_line_info.py", 17))
     elif func == "call":
-        assert (check_file_lines(file_lines, "test_line_info.py", 25))
         assert (check_file_lines(file_lines, "test_line_info.py", 27))
+        assert (check_file_lines(file_lines, "test_line_info.py", 29))
     elif func == "call_noinline":
-        assert (check_file_lines(file_lines, "test_line_info.py", 39))
-        assert (check_file_lines(file_lines, "test_line_info.py", 32))
-        assert (check_file_lines(file_lines, "test_line_info.py", 32))
+        assert (check_file_lines(file_lines, "test_line_info.py", 41))
+        assert (check_file_lines(file_lines, "test_line_info.py", 34))
+        assert (check_file_lines(file_lines, "test_line_info.py", 34))
     elif func == "autotune":
-        assert (check_file_lines(file_lines, "test_line_info.py", 50))
-        assert (check_file_lines(file_lines, "test_line_info.py", 51))
         assert (check_file_lines(file_lines, "test_line_info.py", 52))
+        assert (check_file_lines(file_lines, "test_line_info.py", 53))
+        assert (check_file_lines(file_lines, "test_line_info.py", 54))
     elif func == "dot_combine":
-        assert (check_file_lines(file_lines, "test_line_info.py", 62))
-        assert (check_file_lines(file_lines, "test_line_info.py", 63, should_contain=False))
+        assert (check_file_lines(file_lines, "test_line_info.py", 64))
+        assert (check_file_lines(file_lines, "test_line_info.py", 65, should_contain=False))
     elif func == "cdiv":
-        assert (check_file_lines(file_lines, "test_line_info.py", 72))
+        assert (check_file_lines(file_lines, "test_line_info.py", 74))
 
 
 @pytest.mark.interpreter
@@ -186,22 +188,22 @@ def test_line_info_interpreter(func: str):
     expected_def_lineno = 0
     if func == "single":
         kernel = kernel_single
-        expected_def_lineno = 13
+        expected_def_lineno = 15
     elif func == "call":
         kernel = kernel_call
-        expected_def_lineno = 24
+        expected_def_lineno = 26
     elif func == "call_noinline":
         kernel = kernel_call_noinline
-        expected_def_lineno = 38
+        expected_def_lineno = 40
     elif func == "autotune":
         kernel = kernel_autotune.fn
-        expected_def_lineno = 49
+        expected_def_lineno = 51
     elif func == "dot_combine":
         kernel = kernel_dot_combine
-        expected_def_lineno = 59
+        expected_def_lineno = 61
     elif func == "cdiv":
         kernel = kernel_cdiv
-        expected_def_lineno = 69
+        expected_def_lineno = 71
     kernel.rewrite()
     assert kernel.rewriter.def_file_lineno == expected_def_lineno
 
@@ -222,7 +224,7 @@ def test_line_info_env(monkeypatch, status: str):
 
 
 @pytest.mark.parametrize("status", ["ttir", ""])
-def test_line_info_ir_source(monkeypatch, status, tmp_path):
+def test_line_info_ir_source(monkeypatch, status, tmp_path, fresh_triton_cache):
     try:
         obj_kind, command, anchor, separator = get_disassembler_command_and_debug_line_format()
     except BaseException:
@@ -254,29 +256,27 @@ def test_line_info_ir_source(monkeypatch, status, tmp_path):
 
 
 def test_use_name_loc_as_prefix(fresh_triton_cache):
-    import inspect
-    from triton._filecheck import run_filecheck
 
     @triton.jit
     def kernel_basic(src, N, BLOCK_SIZE: tl.constexpr):
-        # CHECK: #loc = loc("{{.*}}":261:0)
+        # CHECK: #loc = loc("{{.*}}":261:5)
         # CHECK-LABEL:  tt.func public @kernel_basic(
         # CHECK-SAME:                                %src: !tt.ptr<f32> loc("src"(#loc)), %N: i32 loc("N"(#loc)))
-        # CHECK:          %x_plus_1 = arith.constant dense<1.000000e+00> : tensor<16xf32> loc(#loc14)
+        # CHECK:          %x_plus_1 = arith.constant dense<1.000000e+00> : tensor<16xf32> loc(#loc12)
         # CHECK:          %c16_i32 = arith.constant 16 : i32 loc(#loc2)
-        # CHECK:          %pid = tt.get_program_id x : i32 loc(#loc15)
-        # CHECK:          %offset = arith.muli %pid, %c16_i32 : i32 loc(#loc16)
-        # CHECK:          %offsets = tt.make_range {end = 16 : i32, start = 0 : i32} : tensor<16xi32> loc(#loc17)
-        # CHECK:          %offsets_0 = tt.splat %offset : i32 -> tensor<16xi32> loc(#loc18)
-        # CHECK:          %offsets_1 = arith.addi %offsets_0, %offsets : tensor<16xi32> loc(#loc18)
-        # CHECK:          %load_src_store_dst = tt.splat %src : !tt.ptr<f32> -> tensor<16x!tt.ptr<f32>> loc(#loc19)
-        # CHECK:          %load_src_store_dst_2 = tt.addptr %load_src_store_dst, %offsets_1 : tensor<16x!tt.ptr<f32>>, tensor<16xi32> loc(#loc19)
-        # CHECK:          %mask = tt.splat %N : i32 -> tensor<16xi32> loc(#loc20)
-        # CHECK:          %mask_3 = arith.cmpi slt, %offsets_1, %mask : tensor<16xi32> loc(#loc20)
-        # CHECK:          %x_plus_1_4 = tt.load %load_src_store_dst_2, %mask_3 : tensor<16x!tt.ptr<f32>> loc(#loc21)
-        # CHECK:          %x_plus_1_5 = arith.addf %x_plus_1_4, %x_plus_1 : tensor<16xf32> loc(#loc14)
-        # CHECK:          tt.store %load_src_store_dst_2, %x_plus_1_5, %mask_3 : tensor<16x!tt.ptr<f32>> loc(#loc10)
-        # CHECK:          tt.return loc(#loc11)
+        # CHECK:          %pid = tt.get_program_id x : i32 loc(#loc13)
+        # CHECK:          %offset = arith.muli %pid, %c16_i32 : i32 loc(#loc14)
+        # CHECK:          %offsets = tt.make_range {end = 16 : i32, start = 0 : i32} : tensor<16xi32> loc(#loc15)
+        # CHECK:          %offsets_0 = tt.splat %offset : i32 -> tensor<16xi32> loc(#loc16)
+        # CHECK:          %offsets_1 = arith.addi %offsets_0, %offsets : tensor<16xi32> loc(#loc16)
+        # CHECK:          %load_src_store_dst = tt.splat %src : !tt.ptr<f32> -> tensor<16x!tt.ptr<f32>> loc(#loc17)
+        # CHECK:          %load_src_store_dst_2 = tt.addptr %load_src_store_dst, %offsets_1 : tensor<16x!tt.ptr<f32>>, tensor<16xi32> loc(#loc17)
+        # CHECK:          %mask = tt.splat %N : i32 -> tensor<16xi32> loc(#loc18)
+        # CHECK:          %mask_3 = arith.cmpi slt, %offsets_1, %mask : tensor<16xi32> loc(#loc18)
+        # CHECK:          %x_plus_1_4 = tt.load %load_src_store_dst_2, %mask_3 : tensor<16x!tt.ptr<f32>> loc(#loc12)
+        # CHECK:          %x_plus_1_5 = arith.addf %x_plus_1_4, %x_plus_1 : tensor<16xf32> loc(#loc12)
+        # CHECK:          tt.store %load_src_store_dst_2, %x_plus_1_5, %mask_3 : tensor<16x!tt.ptr<f32>> loc(#loc9)
+        # CHECK:          tt.return loc(#loc)
         # CHECK:          } loc(#loc)
         # CHECK:         } loc(#loc)
 
@@ -289,16 +289,13 @@ def test_use_name_loc_as_prefix(fresh_triton_cache):
         # CHECK: #loc7 = loc({{.*}})
         # CHECK: #loc8 = loc({{.*}})
         # CHECK: #loc9 = loc({{.*}})
-        # CHECK: #loc10 = loc({{.*}})
-        # CHECK: #loc11 = loc({{.*}})
-        # CHECK: #loc14 = loc("x_plus_1"(#loc1))
-        # CHECK: #loc15 = loc("pid"(#loc3))
-        # CHECK: #loc16 = loc("offset"(#loc4))
-        # CHECK: #loc17 = loc("offsets"(#loc5))
-        # CHECK: #loc18 = loc("offsets"(#loc6))
-        # CHECK: #loc19 = loc("load_src_store_dst"(#loc7))
-        # CHECK: #loc20 = loc("mask"(#loc8))
-        # CHECK: #loc21 = loc("x_plus_1"(#loc9))
+        # CHECK: #loc12 = loc("x_plus_1"(#loc1))
+        # CHECK: #loc13 = loc("pid"(#loc3))
+        # CHECK: #loc14 = loc("offset"(#loc4))
+        # CHECK: #loc15 = loc("offsets"(#loc5))
+        # CHECK: #loc16 = loc("offsets"(#loc6))
+        # CHECK: #loc17 = loc("load_src_store_dst"(#loc7))
+        # CHECK: #loc18 = loc("mask"(#loc8))
 
         pid = tl.program_id(0)
         offset = pid * BLOCK_SIZE
@@ -313,6 +310,45 @@ def test_use_name_loc_as_prefix(fresh_triton_cache):
                                   constexprs={"BLOCK_SIZE": 16}))
 
     check_template = inspect.getsource(kernel_basic.fn)
+    run_filecheck("placeholder", h.asm["ttir"], check_template)
+
+    if is_hopper_or_newer():
+        # CUDA backend creates aggregate tensor descriptor parameters
+
+        @triton.jit
+        def kernel_tensordesc_param(foo):
+            # CHECK-LABEL: tt.func public @kernel_tensordesc_param
+            # CHECK-SAME: %foo: !tt.tensordesc<32x64xf16>
+            # CHECK-SAME: %foo.shape.0: i32
+            # CHECK-SAME: %foo.shape.1: i32
+            # CHECK-SAME: %foo.stride.0: i64
+            # CHECK-SAME: %foo.stride.1: i64
+            foo
+
+        h = triton.compile(
+            triton.compiler.ASTSource(fn=kernel_tensordesc_param, signature={"foo": "tensordesc<fp16[32,64]>"},
+                                      constexprs={}))
+
+        check_template = inspect.getsource(kernel_tensordesc_param.fn)
+        run_filecheck("placeholder", h.asm["ttir"], check_template)
+
+    from typing import NamedTuple
+
+    @triton.jit
+    def kernel_tuple_param(foo):
+        # CHECK-LABEL: tt.func public @kernel_tuple_param
+        # CHECK-SAME: %foo.x: i32
+        # CHECK-SAME: %foo.y: f64
+        foo
+
+    class Point(NamedTuple):
+        x: str
+        y: str
+
+    foo_tuple = Point("i32", "fp64")
+    h = triton.compile(triton.compiler.ASTSource(fn=kernel_tuple_param, signature={"foo": foo_tuple}, constexprs={}))
+
+    check_template = inspect.getsource(kernel_tuple_param.fn)
     run_filecheck("placeholder", h.asm["ttir"], check_template)
 
     @triton.jit
@@ -424,3 +460,89 @@ def test_use_name_loc_as_prefix(fresh_triton_cache):
     h = triton.compile(triton.compiler.ASTSource(fn=kernel_basic_while, signature={"N": "i32"}, constexprs={}))
     check_template = inspect.getsource(kernel_basic_while.fn)
     run_filecheck("placeholder", h.asm["ttir"], check_template)
+
+
+def test_map_elementwise_has_lineinfo():
+
+    @triton.jit
+    def compare(x, y):
+        if x < y:
+            return x
+        return y
+
+    @triton.jit
+    def kernel(X, Y):
+        # CHECK-NOT: loc(unknown)
+        x = tl.load(X + tl.arange(0, 4))
+        y = tl.load(Y + tl.arange(0, 4))
+        z = tl.map_elementwise(compare, x, y)
+        tl.device_print("", z)
+
+    kernel_info = kernel.warmup(torch.float32, torch.float32, grid=(1, ))
+    check_template = inspect.getsource(kernel.fn)
+    run_filecheck("test", kernel_info.asm["ttir"], check_template)
+
+
+def test_line_and_column_numbers(fresh_triton_cache):
+
+    @triton.jit
+    def kernel_basic(src, N, BLOCK_SIZE: tl.constexpr):
+        # CHECK: #loc = loc("{{.*}}":489:5)
+        # CHECK: #loc10 = loc("src"(#loc))
+        # CHECK: #loc11 = loc("N"(#loc))
+        # CHECK-LABEL:  tt.func public @kernel_basic(
+        # CHECK-SAME:                                %src: !tt.ptr<f32> loc("src"(#loc)), %N: i32 loc("N"(#loc)))
+        # CHECK:          %x_plus_1 = arith.constant dense<1.000000e+00> : tensor<16xf32> loc(#loc12)
+        # CHECK:          %c16_i32 = arith.constant 16 : i32 loc(#loc2)
+        # CHECK:          %pid = tt.get_program_id x : i32 loc(#loc13)
+        # CHECK:          %offset = arith.muli %pid, %c16_i32 : i32 loc(#loc14)
+        # CHECK:          %offsets = tt.make_range {end = 16 : i32, start = 0 : i32} : tensor<16xi32> loc(#loc15)
+        # CHECK:          %offsets_0 = tt.splat %offset : i32 -> tensor<16xi32> loc(#loc16)
+        # CHECK:          %offsets_1 = arith.addi %offsets_0, %offsets : tensor<16xi32> loc(#loc16)
+        # CHECK:          %load_src_store_dst = tt.splat %src : !tt.ptr<f32> -> tensor<16x!tt.ptr<f32>> loc(#loc17)
+        # CHECK:          %load_src_store_dst_2 = tt.addptr %load_src_store_dst, %offsets_1 : tensor<16x!tt.ptr<f32>>, tensor<16xi32> loc(#loc17)
+        # CHECK:          %mask = tt.splat %N : i32 -> tensor<16xi32> loc(#loc18)
+        # CHECK:          %mask_3 = arith.cmpi slt, %offsets_1, %mask : tensor<16xi32> loc(#loc18)
+        # CHECK:          %x_plus_1_4 = tt.load %load_src_store_dst_2, %mask_3 : tensor<16x!tt.ptr<f32>> loc(#loc12)
+        # CHECK:          %x_plus_1_5 = arith.addf %x_plus_1_4, %x_plus_1 : tensor<16xf32> loc(#loc12)
+        # CHECK:          tt.store %load_src_store_dst_2, %x_plus_1_5, %mask_3 : tensor<16x!tt.ptr<f32>> loc(#loc9)
+        # CHECK:          tt.return loc(#loc)
+        # CHECK:          } loc(#loc)
+        # CHECK:         } loc(#loc)
+
+        # CHECK: #loc1 = loc({{.*}}:535:20)
+        # CHECK: #loc2 = loc(unknown)
+        # CHECK: #loc3 = loc({{.*}}:530:15)
+        # CHECK: #loc4 = loc({{.*}}:531:18)
+        # CHECK: #loc5 = loc({{.*}}:532:28)
+        # CHECK: #loc6 = loc({{.*}}:532:19)
+        # CHECK: #loc7 = loc({{.*}}:533:30)
+        # CHECK: #loc8 = loc({{.*}}:534:16)
+        # CHECK: #loc9 = loc({{.*}}:536:9)
+        # CHECK: #loc12 = loc("x_plus_1"(#loc1))
+        # CHECK: #loc13 = loc("pid"(#loc3))
+        # CHECK: #loc14 = loc("offset"(#loc4))
+        # CHECK: #loc15 = loc("offsets"(#loc5))
+        # CHECK: #loc16 = loc("offsets"(#loc6))
+        # CHECK: #loc17 = loc("load_src_store_dst"(#loc7))
+        # CHECK: #loc18 = loc("mask"(#loc8))
+
+        pid = tl.program_id(0)
+        offset = pid * BLOCK_SIZE
+        offsets = offset + tl.arange(0, BLOCK_SIZE)
+        load_src_store_dst = src + offsets
+        mask = offsets < N
+        x_plus_1 = tl.load(load_src_store_dst, mask=mask) + 1
+        tl.store(load_src_store_dst, x_plus_1, mask=mask)
+
+    h = triton.compile(
+        triton.compiler.ASTSource(fn=kernel_basic, signature={"src": "*fp32", "N": "i32", "BLOCK_SIZE": "constexpr"},
+                                  constexprs={"BLOCK_SIZE": 16}))
+
+    check_template = inspect.getsource(kernel_basic.fn)
+    run_filecheck("placeholder", h.asm["ttir"], check_template)
+
+
+@pytest.fixture(autouse=True)
+def with_line_info(fresh_knobs):
+    fresh_knobs.compilation.disable_line_info = False

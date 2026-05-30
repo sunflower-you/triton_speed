@@ -1,4 +1,3 @@
-import functools
 from typing import Dict, Optional, Union, Any
 
 import triton
@@ -9,12 +8,12 @@ from triton._C.libtriton import nvidia as triton_nvidia
 from triton._C.libtriton import passes as triton_passes
 from triton._C.libproton import proton as libproton
 from triton.compiler import LazyDict
-from triton.runtime.jit import JITFunction
 from triton.runtime._allocation import set_profile_allocator, NullAllocator
 from triton.backends import backends
 
 from .hook import Hook
-from ..flags import set_instrumentation_on, set_instrumentation_off
+from ..flags import flags
+from ..state import metadata_state
 from .. import mode
 
 # TODO(fywkevin): add support for major.minor
@@ -39,7 +38,8 @@ class CudaAllocator:
 
         # Create the buffer
         import torch
-        buffer = torch.empty((aligned_size, ), dtype=torch.uint8, device="cuda")
+        with metadata_state():
+            buffer = torch.zeros((aligned_size, ), dtype=torch.uint8, device="cuda")
         self.instrumentation_hook.buffer = buffer
         return buffer
 
@@ -151,7 +151,7 @@ class InstrumentationHook(Hook):
 
         InstrumentationHook.active_count += 1
 
-        set_instrumentation_on()
+        flags.instrumentation_on = True
 
         device = triton.runtime.driver.active.get_current_device()
         max_shared_mem = triton.runtime.driver.active.utils.get_device_properties(device)["max_shared_mem"]
@@ -176,7 +176,6 @@ class InstrumentationHook(Hook):
                 triton_proton.add_sched_barriers(pm)
 
         def to_llvm_passes(pm):
-            triton_proton.add_allocate_proton_global_scratch_buffer(pm)
             if backend_name == "nvidia":
                 triton_proton.add_convert_proton_nvidia_gpu_to_llvm(pm)
             elif backend_name == "amd":
@@ -193,16 +192,8 @@ class InstrumentationHook(Hook):
         # Set up the profiling allocator
         set_profile_allocator(self.allocator)
 
-        original_run = JITFunction.run
-
-        original_mode = self.mode
-
-        @functools.wraps(original_run)
-        def instrumented_run(self, *args, **kwargs):
-            kwargs["instrumentation_mode"] = str(original_mode)
-            return original_run(self, *args, **kwargs)
-
-        JITFunction.run = instrumented_run
+        # Set the instrumentation mode
+        triton.knobs.compilation.instrumentation_mode = str(self.mode)
 
     def deactivate(self):
         if InstrumentationHook.active_count == 0:
@@ -216,18 +207,16 @@ class InstrumentationHook(Hook):
         backends[backend_name].compiler.instrumentation = {}
 
         # No runtime instrumentation hook is active anymore
-        set_instrumentation_off()
+        flags.instrumentation_on = False
 
-        # Restore original JIT function run method
-        if hasattr(JITFunction.run, "__wrapped__"):
-            JITFunction.run = JITFunction.run.__wrapped__
+        # Restore the instrumentation mode
+        triton.knobs.compilation.instrumentation_mode = ""
 
         # Reset profile allocator
         set_profile_allocator(NullAllocator())
 
         # Reset host memory for external processing
-        if InstrumentationHook.enable_host_buffer:
-            InstrumentationHook.host_buffer = None
+        InstrumentationHook.host_buffer = None
 
         # Reset the buffer reference
         self.buffer = None
@@ -258,6 +247,12 @@ class InstrumentationHook(Hook):
             libproton.init_function_metadata(function, name, scope_id_names, scope_id_parents, metadata_path)
         else:
             raise RuntimeError(f"IR path not found in metadata for function {function}")
+
+    def destroy_handle(self, module: Any, function: Any, name: str, metadata_group: Dict[str, str], hash: str) -> None:
+        if not function:
+            return
+        self.metadata_path.pop(function, None)
+        libproton.destroy_function_metadata(function)
 
     def _data_ptr(self) -> int:
         return 0 if self.buffer is None else self.buffer.data_ptr()

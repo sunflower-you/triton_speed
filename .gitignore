@@ -14,6 +14,7 @@ python/triton_kernels/triton*.egg-info/
 
 python/triton/_C/*.pyd
 python/triton/_C/*.so
+python/triton/_C/*.so.*
 python/triton/_C/*.dylib
 python/triton/_C/*.pdb
 python/triton/_C/*.exe
@@ -27,7 +28,9 @@ python/triton/backends/*
 !python/triton/backends/driver.py
 
 # Language extras
-python/triton/language/extra
+python/triton/language/extra/*
+!python/triton/language/extra/__init__.py
+!python/triton/language/extra/libdevice.py
 
 # Tools extras
 python/triton/tools/extra
@@ -35,11 +38,11 @@ python/triton/tools/extra
 # Proton
 python/triton/profiler
 
-# Pytest
-pytest.ini
-
 # Instrumentation
 python/triton/instrumentation
+
+# MLIR Plugin
+python/triton/plugins
 
 # Python caches
 __pycache__/
@@ -63,15 +66,21 @@ cmake-build-*
 cuobjdump
 nvdisasm
 ptxas
+ptxas-blackwell
 
 # Third-party include
 third_party/nvidia/backend/include
 third_party/nvidia/backend/lib/cupti
+third_party/nvidia/backend/lib/cupti-blackwell
+third_party/nvidia/backend/lib/gsan.ll
 
 # Docs
 docs/_build/
+docs/_generated/
+docs/gluon/api/generated/
 docs/python-api/generated/
 docs/dialects/
+docs/getting-started/examples
 docs/getting-started/tutorials
 docs/sg_execution_times.rst
 !python/tutorials/*.py
@@ -83,9 +92,12 @@ docs/sg_execution_times.rst
 /compile_commands.json
 .vscode
 .vs
+.cursor
 
 # Vim
 *.swp
 
 # macOS
 .DS_Store
+
+AGENTS.override.md

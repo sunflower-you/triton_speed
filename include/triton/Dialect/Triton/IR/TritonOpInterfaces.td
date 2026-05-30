@@ -49,7 +49,12 @@ def DotOpInterface : OpInterface<"DotOpInterface"> {
       /*retType=*/"::mlir::Value",
       /*methodName=*/"getB",
       /*args=*/(ins)>,
-  InterfaceMethod<
+    InterfaceMethod<
+      /*desc=*/"Get the output tensor",
+      /*retType=*/"::mlir::Value",
+      /*methodName=*/"getD",
+      /*args=*/(ins)>,
+    InterfaceMethod<
       /*desc=*/"Verify the dimensions of the A and B DotOp operands.",
       /*retType=*/"bool",
       /*methodName=*/"verifyDims",
@@ -100,6 +105,46 @@ def TT_DescriptorStoreLikeOpInterface : OpInterface<"DescriptorStoreLikeOpInterf
       /*retType=*/"::mlir::TypedValue<mlir::RankedTensorType>",
       /*methodName=*/"getSrc",
       /*args=*/(ins)>,
+    InterfaceMethod<
+      /*desc=*/"Get mutable source tensor",
+      /*retType=*/"::mlir::OpOperand&",
+      /*methodName=*/"getSrcMutable",
+      /*args=*/(ins)>,
+  ];
+}
+
+def TT_DescriptorLoadLikeOpInterface : OpInterface<"DescriptorLoadLikeOpInterface", [TT_DescriptorOpInterface]> {
+  let description = [{
+    Common marker interface for operations that load from tensor descriptors.
+  }];
+
+  let cppNamespace = "::mlir::triton";
+}
+
+def PredicatedOpInterface : OpInterface<"PredicatedOpInterface"> {
+  let description = [{
+    Common interface for operations that carry a predicate or mask operand that
+    can be combined with a pipeline predicate.
+  }];
+
+  let cppNamespace = "::mlir::triton";
+
+  let methods = [
+    InterfaceMethod<
+      /*desc=*/"Return the current predicate or mask operand.",
+      /*retType=*/"::mlir::Value",
+      /*methodName=*/"getPredicateOperand",
+      /*args=*/(ins)>,
+    InterfaceMethod<
+      /*desc=*/"Update the predicate or mask operand.",
+      /*retType=*/"void",
+      /*methodName=*/"setPredicateOperand",
+      /*args=*/(ins "::mlir::Value":$pred)>,
+    InterfaceMethod<
+      /*desc=*/"Return a type whose shape determines the predicate operand type.",
+      /*retType=*/"::mlir::Type",
+      /*methodName=*/"getPredicateOperandTypeLike",
+      /*args=*/(ins)>
   ];
 }
 

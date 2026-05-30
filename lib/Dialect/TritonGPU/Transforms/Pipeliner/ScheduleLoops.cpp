@@ -23,9 +23,12 @@ namespace mlir::triton::gpu {
 // scheduleLoops
 //===----------------------------------------------------------------------===//
 
-bool hasGpuBarriers(scf::ForOp forOp) {
-  WalkResult result = forOp.walk(
-      [&](mlir::gpu::BarrierOp barrier) { return WalkResult::interrupt(); });
+template <typename... OpTypes> static bool containsAny(scf::ForOp forOp) {
+  WalkResult result = forOp.walk([&](Operation *op) {
+    if (isa<OpTypes...>(op))
+      return WalkResult::interrupt();
+    return WalkResult::advance();
+  });
   return result.wasInterrupted();
 }
 
@@ -37,9 +40,10 @@ bool isSafeToPipeline(scf::ForOp forOp) {
   // Don't pipeline outer loops.
   if (isOuterLoop(forOp))
     return false;
-  // Skip loops with barriers.
-  if (hasGpuBarriers(forOp))
+  // Skip loops with barriers, asserts or prints
+  if (containsAny<ttg::BarrierOp, tt::AssertOp, tt::PrintOp>(forOp))
     return false;
+
   return true;
 }
 
@@ -263,11 +267,11 @@ CoarseSchedule getInitialSchedule(scf::ForOp forOp,
     // root at the stages of the latency ops to prune unnecessary stages.
     auto isLatencyOp = [&](Operation &op) {
       return opLatency.count(&op) ||
-             isa<LoadOp, DescriptorLoadOp, DescriptorGatherOp, LocalStoreOp,
+             isa<LoadOp, DescriptorLoadLikeOpInterface, LocalStoreOp,
                  LocalLoadOp, ttng::TMEMLoadOp, ttng::TMEMStoreOp,
-                 AsyncCopyGlobalToLocalOp, ttng::AsyncTMACopyGlobalToLocalOp,
-                 ttng::AsyncTMAGatherOp, ttng::MMAv5OpInterface,
-                 ttng::WaitBarrierOp, ttng::ArriveBarrierOp>(op);
+                 AsyncCopyGlobalToLocalOp, ttng::TMAOpInterface,
+                 ttng::MMAv5OpInterface, ttng::WaitBarrierOp,
+                 ttng::ArriveBarrierOp>(op);
     };
 
     // If there are no latency ops or all latency ops are in the same stage, we

@@ -34,7 +34,7 @@ Operation *createSchedBarrier(PatternRewriter &rewriter, Location loc,
                               mlir::amdgpu::sched_barrier_opt_enum maskValue) {
   IntegerAttr mask =
       rewriter.getI32IntegerAttr(static_cast<int32_t>(maskValue));
-  return rewriter.create<ROCDL::SchedBarrier>(loc, mask);
+  return ROCDL::SchedBarrier::create(rewriter, loc, mask);
 }
 
 // Insert an experimental intrinsic for instruction group level parallelism.
@@ -42,15 +42,13 @@ Operation *createSchedBarrier(PatternRewriter &rewriter, Location loc,
 Operation *createIglpOpt(PatternRewriter &rewriter, Location loc, int value) {
   IntegerAttr iglpValue =
       rewriter.getI32IntegerAttr(static_cast<int32_t>(value));
-  return rewriter.create<ROCDL::IglpOpt>(loc, iglpValue);
+  return ROCDL::IglpOpt::create(rewriter, loc, iglpValue);
 }
 
 struct InstructionSchedHintsRewriter
     : public OpRewritePattern<triton::amdgpu::InstructionSchedHint> {
 
-  InstructionSchedHintsRewriter(MLIRContext *ctx, StringRef arch,
-                                int32_t numStages)
-      : OpRewritePattern(ctx), numStages(numStages) {}
+  InstructionSchedHintsRewriter(MLIRContext *ctx) : OpRewritePattern(ctx) {}
 
   LogicalResult
   matchAndRewrite(triton::amdgpu::InstructionSchedHint instructionSchedHint,
@@ -94,24 +92,20 @@ struct InstructionSchedHintsRewriter
     rewriter.eraseOp(instructionSchedHint);
     return success();
   }
-
-private:
-  int32_t numStages;
 };
 
 struct TritonAMDGPULowerInstructionSchedHints
     : public triton::impl::TritonAMDGPULowerInstructionSchedHintsBase<
           TritonAMDGPULowerInstructionSchedHints> {
 
-  explicit TritonAMDGPULowerInstructionSchedHints(StringRef arch,
+  explicit TritonAMDGPULowerInstructionSchedHints(StringRef gfxArch,
                                                   int32_t numStages) {
-    this->arch = std::move(arch.str());
+    this->gfxArch = gfxArch.str();
     this->numStages = numStages;
   }
 
   void runOnOperation() override {
     MLIRContext *ctx = &getContext();
-    ModuleOp mod = getOperation();
 
     ConversionTarget target(*ctx);
     target.addLegalDialect<LLVM::LLVMDialect>();
@@ -122,8 +116,7 @@ struct TritonAMDGPULowerInstructionSchedHints
 
     RewritePatternSet patterns(ctx);
 
-    patterns.add<InstructionSchedHintsRewriter>(ctx, this->arch,
-                                                this->numStages);
+    patterns.add<InstructionSchedHintsRewriter>(ctx);
 
     if (failed(applyPartialConversion(getOperation(), target,
                                       std::move(patterns)))) {
@@ -138,7 +131,7 @@ struct TritonAMDGPUInsertInstructionSchedHints
           TritonAMDGPUInsertInstructionSchedHints> {
 
   explicit TritonAMDGPUInsertInstructionSchedHints(StringRef variant) {
-    this->variant = std::move(variant.str());
+    this->variant = variant.str();
   }
 
   void runOnOperation() override {
@@ -170,8 +163,8 @@ struct TritonAMDGPUInsertInstructionSchedHints
         if (result.wasInterrupted()) {
           OpBuilder rewriter(ctx);
           rewriter.setInsertionPointToStart(forOp.getBody());
-          rewriter.create<triton::amdgpu::InstructionSchedHint>(forOp->getLoc(),
-                                                                schedHint);
+          triton::amdgpu::InstructionSchedHint::create(
+              rewriter, forOp->getLoc(), schedHint);
         }
       });
       break;
@@ -185,9 +178,9 @@ struct TritonAMDGPUInsertInstructionSchedHints
 
 namespace mlir::triton {
 std::unique_ptr<OperationPass<ModuleOp>>
-createTritonAMDGPULowerInstructionSchedHintsPass(StringRef arch,
+createTritonAMDGPULowerInstructionSchedHintsPass(StringRef gfxArch,
                                                  int32_t numStages) {
-  return std::make_unique<TritonAMDGPULowerInstructionSchedHints>(arch,
+  return std::make_unique<TritonAMDGPULowerInstructionSchedHints>(gfxArch,
                                                                   numStages);
 }
 

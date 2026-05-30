@@ -82,6 +82,21 @@ def TritonGPUProxyFenceInsertion : Pass<"triton-nvidia-gpu-proxy-fence-insertion
   ];
 }
 
+def TritonNvidiaGPUTMemBarrierInsertionPass : Pass<"triton-nvidia-gpu-tmem-barrier-insertion", "mlir::ModuleOp"> {
+  let summary = "Insert barriers to order tensor-memory reuse";
+
+  let description = [{
+    This pass inserts CTA barriers between tensor-memory accesses that reuse
+    aliasing physical tensor-memory storage and require ordering across logical
+    allocation lifetimes.
+  }];
+
+  let dependentDialects = [
+    "mlir::triton::gpu::TritonGPUDialect",
+    "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"
+  ];
+}
+
 def TritonNvidiaGPUTMALoweringPass : Pass<"triton-nvidia-tma-lowering", "mlir::ModuleOp"> {
   let summary = "lower to TMA load/store operations";
 
@@ -171,6 +186,16 @@ def TritonNvidiaGPURemoveTMEMTokensPass : Pass<"triton-nvidia-gpu-remove-tmem-to
   let description = [{
     The `triton-nvidia-gpu-remove-tmem-tokens` pass removes TMEM memory
     dependency tokens from the IR, after they are no longer needed.
+  }];
+}
+
+def TritonNvidiaGPUCheckMatmulTwoCTAPass : Pass<"triton-nvidia-check-matmul-two-cta", "mlir::ModuleOp"> {
+  let summary = "Verify consistent two_ctas usage across matmuls";
+
+  let description = [{
+    Inspect all matmul operations and ensure they agree on the `two_ctas`
+    setting. Propagate the chosen value to the module so later lowering steps
+    can access it. Compilation fails if mixed configurations are detected.
   }];
 }
 

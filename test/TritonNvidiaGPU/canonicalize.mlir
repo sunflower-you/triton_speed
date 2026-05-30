@@ -2,7 +2,7 @@
 
 #linear = #ttg.linear<{register = [[0, 1], [0, 2], [32, 0]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [[0, 0], [0, 0], [64, 0]], block = []}>
 #tmem_scales = #ttng.tensor_memory_scales_encoding<>
-#tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, unpacked = true>
+#tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
 module attributes {"ttg.num-warps" = 8 : i32, "ttg.num-ctas" = 1 : i32, "ttg.target" = "cuda:80"} {
 
 // CHECK-LABEL: @test_dce_tmem_alloc
@@ -18,6 +18,13 @@ tt.func @reinterpret_fold(%arg0: !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_m
   %0 = ttg.memdesc_reinterpret %arg0 : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory> -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory>
   // CHECK-NEXT: return %arg0
   tt.return %0 : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory>
+}
+
+// CHECK-LABEL: @preserve_ld_acquire
+llvm.func @preserve_ld_acquire(%arg0: !llvm.ptr<1>) {
+  // CHECK: nvg.ld_acquire acquire, gpu, %arg0 : (!llvm.ptr<1>) -> i32
+  %0 = nvg.ld_acquire acquire, gpu, %arg0 : (!llvm.ptr<1>) -> i32
+  llvm.return
 }
 
 }  // end module

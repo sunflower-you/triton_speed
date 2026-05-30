@@ -13,6 +13,10 @@ struct WmmaIntrinsic {
                                             unsigned nDim, unsigned inputKDim,
                                             Type aElemType, Type bElemType,
                                             Type dElemType);
+  // Gets the wmma intrinsic based on exact match of all parameters.
+  static FailureOr<WmmaIntrinsic> get(int version, unsigned mDim, unsigned nDim,
+                                      unsigned kDim, Type aElemType,
+                                      Type bElemType, Type dElemType);
 
   WmmaIntrinsic(StringRef symbol, unsigned m, unsigned n, unsigned k,
                 unsigned kB, Type aET, Type bET, Type dET)
@@ -38,6 +42,34 @@ struct WmmaIntrinsic {
   Type aElementType;
   Type bElementType;
   Type dElementType;
+};
+
+struct WmmaScaleIntrinsic {
+  enum class IntrinsicFamily { F8F6F4, F4 };
+  static FailureOr<WmmaScaleIntrinsic> get(int version, unsigned mDim,
+                                           unsigned nDim, Type aElemType,
+                                           Type bElemType, Type dElemType,
+                                           bool isScale16, bool isTransposed);
+
+  WmmaScaleIntrinsic(StringRef symbol, unsigned m, unsigned n, unsigned kDim,
+                     unsigned kBaseAVal, unsigned kBaseBVal, Type dET)
+      : name(symbol), mDim(m), nDim(n), kDim(kDim), kBaseA(kBaseAVal),
+        kBaseB(kBaseBVal), dElemType(dET) {}
+  WmmaScaleIntrinsic(const WmmaScaleIntrinsic &other) = default;
+  WmmaScaleIntrinsic(WmmaScaleIntrinsic &&other) = default;
+  WmmaScaleIntrinsic() = default;
+  WmmaScaleIntrinsic &operator=(WmmaScaleIntrinsic &&other) = default;
+
+  llvm::StringRef name;
+  // m, n, and k refer to the shapes of the two operands of an wmma intrinsic:
+  // Operand A has shape [m]x[k]; operand B has shape [k]x[n].
+  unsigned mDim;
+  unsigned nDim;
+  unsigned kDim;
+  // kBase is the number of elements each thread holds along K for A/B.
+  unsigned kBaseA;
+  unsigned kBaseB;
+  Type dElemType;
 };
 } // namespace mlir
 

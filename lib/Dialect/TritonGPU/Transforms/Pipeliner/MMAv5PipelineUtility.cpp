@@ -14,8 +14,32 @@ namespace ttng = mlir::triton::nvidia_gpu;
 // MMA Pipeline Analysis
 //===----------------------------------------------------------------------===//
 
+bool triton::nvidia_gpu::areScalesPipelineable(ttng::TCGen5MMAScaledOp scaledOp,
+                                               scf::ForOp forOp) {
+  if (!isa<triton::gpu::SharedEncodingTrait>(
+          scaledOp.getAScale().getType().getEncoding()) &&
+          !forOp.isDefinedOutsideOfLoop(scaledOp.getAScale()) ||
+      !isa<triton::gpu::SharedEncodingTrait>(
+          scaledOp.getBScale().getType().getEncoding()) &&
+          !forOp.isDefinedOutsideOfLoop(scaledOp.getBScale())) {
+    return false;
+  }
+
+  return true;
+}
+
 bool ttng::MMAv5PipelineableOperandsHelper::isOperandPipelineable(
     Value v, Operation *&foundDef) {
+  return ttng::isOperandPipelineableBase(
+      v, forOp, foundDef, [](Operation *) { return false; },
+      isLoadToBePipelined);
+}
+
+bool ttng::isOperandPipelineableBase(
+    Value v, scf::ForOp forOp, Operation *&foundDef,
+    std::function<bool(Operation *)> isPipelineable,
+    std::function<bool(Operation *)> isLoadToBePipelined) {
+
   if (forOp.isDefinedOutsideOfLoop(v)) {
     return true;
   }
@@ -24,6 +48,9 @@ bool ttng::MMAv5PipelineableOperandsHelper::isOperandPipelineable(
   }
   while (isa<ttg::MemDescTransOp, ttg::MemDescReshapeOp>(v.getDefiningOp())) {
     v = v.getDefiningOp()->getOperand(0);
+  }
+  if (isPipelineable(v.getDefiningOp())) {
+    return true;
   }
   if (isa<ttg::LocalStoreOp, ttng::TMEMStoreOp, ttng::TMEMAllocOp>(
           v.getDefiningOp())) {
@@ -42,7 +69,7 @@ bool ttng::MMAv5PipelineableOperandsHelper::isOperandPipelineable(
     return true;
   }
   auto localAllocSrc = localAlloc.getSrc().getDefiningOp();
-  if (!isa<tt::LoadOp, tt::DescriptorLoadOp, tt::DescriptorGatherOp>(
+  if (!isa_and_nonnull<tt::LoadOp, tt::DescriptorLoadLikeOpInterface>(
           localAllocSrc)) {
     return false;
   }
@@ -87,12 +114,7 @@ void ttng::MMAv5PipelineableOperandsHelper::run() {
   // For scaled MMA check if the scales are passed through shared memory, and
   // also coming from load or outside the loop.
   if (auto scaledOp = dyn_cast<ttng::TCGen5MMAScaledOp>(mmaOp.getOperation())) {
-    if (!isa<ttg::SharedEncodingTrait>(
-            scaledOp.getAScale().getType().getEncoding()) &&
-            !forOp.isDefinedOutsideOfLoop(scaledOp.getAScale()) ||
-        !isa<ttg::SharedEncodingTrait>(
-            scaledOp.getBScale().getType().getEncoding()) &&
-            !forOp.isDefinedOutsideOfLoop(scaledOp.getBScale())) {
+    if (!ttng::areScalesPipelineable(scaledOp, forOp)) {
       // Undecidable, we could follow the tmem use-def chain to find the first
       // tmem_load.
       isOperandsStateDetermined = false;
@@ -198,9 +220,19 @@ static bool accUseFlagSetToFalse(ttng::MMAv5OpInterface mma, scf::ForOp forOp) {
     return true;
   }
   auto yieldOp = cast<scf::YieldOp>(forOp.getBody()->getTerminator());
+  Value accUseFlagInit;
   while (auto blockArg = dyn_cast<BlockArgument>(accUseFlag)) {
     accUseFlag = yieldOp.getOperand(blockArg.getArgNumber() - 1);
+    accUseFlagInit = forOp.getInitArgs()[blockArg.getArgNumber() - 1];
   }
+
+  if (accUseFlagInit && matchPattern(accUseFlagInit, m_Zero()) &&
+      matchPattern(accUseFlag, m_One())) {
+    // A simple case for nested loops - the use flag is initialized to false
+    // and uncondionally set to true in later iterations
+    return true;
+  }
+
   // If the accUseFlag is overwritten in the loop, we treat it as a 'false'
   // with condition being ~accUseFlag.
   return accUseFlag.getDefiningOp() &&
@@ -269,7 +301,6 @@ bool ttng::hasLoadsAfterMMA(ttng::MMAv5OpInterface mma, scf::ForOp forOp) {
 ttng::TMEMAllocOp ttng::createTMemAlloc(OpBuilder &builder,
                                         ttng::TMEMAllocOp oldTMemAllocOp,
                                         bool multiBufferred, int numStages) {
-  Location loc = oldTMemAllocOp.getLoc();
   auto oldRetType = oldTMemAllocOp.getType();
   SmallVector<int64_t> shape = {oldRetType.getShape().begin(),
                                 oldRetType.getShape().end()};
@@ -279,7 +310,7 @@ ttng::TMEMAllocOp ttng::createTMemAlloc(OpBuilder &builder,
   Type accMemDescType = triton::gpu::MemDescType::get(
       shape, oldRetType.getElementType(), oldRetType.getEncoding(),
       oldRetType.getMemorySpace(), /*mutableMemory=*/true);
-  return builder.create<ttng::TMEMAllocOp>(
-      oldTMemAllocOp.getLoc(), accMemDescType,
+  return ttng::TMEMAllocOp::create(
+      builder, oldTMemAllocOp.getLoc(), accMemDescType,
       builder.getType<gpu::AsyncTokenType>(), /*src=*/Value());
 }

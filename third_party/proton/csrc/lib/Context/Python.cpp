@@ -1,7 +1,8 @@
 #include "Context/Python.h"
+#include "Utility/String.h"
 #include "pybind11/pybind11.h"
-#include <algorithm>
 #include <string>
+#include <utility>
 
 namespace proton {
 
@@ -25,32 +26,15 @@ PyObject *_Py_XNewRef(PyObject *obj) {
 #define Py_XNewRef(obj) _Py_XNewRef((PyObject *)(obj))
 #endif
 
-// bpo-40421 added PyFrame_GetCode() to Python 3.9.0b1
-#if PY_VERSION_HEX < 0x030900B1
-PyCodeObject *getFrameCodeObject(PyFrameObject *frame) {
-  assert(frame != nullptr);
-  assert(frame->f_code != nullptr);
-  return (PyCodeObject *)(Py_NewRef(frame->f_code));
-}
-#else
 PyCodeObject *getFrameCodeObject(PyFrameObject *frame) {
   assert(frame != nullptr);
   return PyFrame_GetCode(frame);
 }
-#endif
 
-// bpo-40421 added PyFrame_GetBack() to Python 3.9.0b1
-#if PY_VERSION_HEX < 0x030900B1
-PyFrameObject *getFrameBack(PyFrameObject *frame) {
-  assert(frame != nullptr);
-  return (PyFrameObject *)(Py_XNewRef(frame->f_back));
-}
-#else
 PyFrameObject *getFrameBack(PyFrameObject *frame) {
   assert(frame != nullptr);
   return PyFrame_GetBack(frame);
 }
-#endif
 
 std::string unpackPyobject(PyObject *pyObject) {
   if (PyBytes_Check(pyObject)) {
@@ -77,20 +61,24 @@ std::vector<Context> PythonContextSource::getContextsImpl() {
   PyFrameObject *frame = PyEval_GetFrame();
   Py_XINCREF(frame);
 
-  std::vector<Context> contexts;
+  std::vector<Context> reversedContexts;
   while (frame != nullptr) {
     PyCodeObject *f_code = getFrameCodeObject(frame);
     size_t lineno = PyFrame_GetLineNumber(frame);
-    size_t firstLineNo = f_code->co_firstlineno;
     std::string file = unpackPyobject(f_code->co_filename);
     std::string function = unpackPyobject(f_code->co_name);
-    auto pythonFrame = file + ":" + function + "@" + std::to_string(lineno);
-    contexts.push_back(Context(pythonFrame));
+    auto pythonFrame = formatFileLineFunction(file, lineno, function);
+    reversedContexts.emplace_back(std::move(pythonFrame));
     auto newFrame = getFrameBack(frame);
     Py_DECREF(frame);
     frame = newFrame;
   }
-  std::reverse(contexts.begin(), contexts.end());
+  std::vector<Context> contexts;
+  contexts.reserve(reversedContexts.size());
+  for (auto iter = reversedContexts.rbegin(); iter != reversedContexts.rend();
+       ++iter) {
+    contexts.push_back(*iter);
+  }
   return contexts;
 }
 

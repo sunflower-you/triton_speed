@@ -1,6 +1,6 @@
 // RUN: triton-opt %s --allocate-shared-memory --convert-triton-gpu-to-llvm='compute-capability=90 ptx-version=83' --convert-nv-gpu-to-llvm | mlir-translate --mlir-to-llvmir | opt -O3 -S | llc -mtriple nvptx64-nvidia-cuda -mcpu=sm_90 -mattr=+ptx83 | FileCheck --dump-input-context=20 %s
 
-#mma = #ttg.nvidia_mma<{versionMajor = 3, versionMinor = 0, warpsPerCTA = [4, 1], CTAsPerCGA = [1, 1], CTASplitNum = [1, 1], CTAOrder = [1, 0], instrShape = [16, 64, 16]}>
+#mma = #ttg.nvidia_mma<{versionMajor = 3, versionMinor = 0, warpsPerCTA = [4, 1], instrShape = [16, 64, 16]}>
 #dot_op = #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth=4}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
 // CHECK-LABEL: cvt_mma_to_dot_fp8
@@ -8,7 +8,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
 
     // As there are 64 elements per lane, we don't use variables to track them.
 
-    // CHECK-COUNT-64: ld.param.b8
+    // CHECK-COUNT-64: ld.param::entry.b8
 
     // Intra-warp layout conversions can be viewed as permutations of register
     // and lane basis vectors. This can be read off from the linear layouts:

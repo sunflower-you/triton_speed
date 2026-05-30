@@ -15,15 +15,16 @@ def ConvertProtonAMDGPUToLLVM : Pass<"convert-proton-amd-gpu-to-llvm", "mlir::Mo
                              "mlir::gpu::GPUDialect",
                              "mlir::scf::SCFDialect",
                              "mlir::LLVM::LLVMDialect",
-      						 "mlir::ROCDL::ROCDLDialect",
+                             "mlir::ROCDL::ROCDLDialect",
                              "mlir::triton::TritonDialect",
                              "mlir::triton::gpu::TritonGPUDialect",
+                             "mlir::triton::amdgpu::TritonAMDGPUDialect",
                              "mlir::triton::proton::ProtonDialect",
                              "mlir::triton::proton::gpu::ProtonGPUDialect"];
 
     let options = [
-        Option<"arch", "arch", "std::string", /*default*/"\"\"",
-               "gfx target device architecture, e.g., gfx942">
+        Option<"gfxArch", "gfx-arch", "std::string", /*default*/"std::string{}",
+               "Specify the GFX architecture name, e.g., gfx942, gfx950, etc.">
     ];
 }
 

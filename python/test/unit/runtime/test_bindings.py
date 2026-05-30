@@ -4,6 +4,8 @@ import triton.language as tl
 import torch
 import math
 
+_BLOCK_SIZE = 16
+
 
 @triton.jit
 def add_helper(x, y):
@@ -24,7 +26,9 @@ def add_kernel(
     mask = offsets < n_elements
     x = tl.load(in_ptr0 + offsets, mask=mask)
     y = tl.load(in_ptr1 + offsets, mask=mask)
-    output = add_helper(x, y)
+    x2d = x[None, :]
+    x1d = tl.reshape(x2d, [BLOCK_SIZE])
+    output = add_helper(x1d, y)
     tl.store(out_ptr + offsets, output, mask=mask)
 
 
@@ -50,6 +54,20 @@ def test_module_walk(device):
             op.get_str_attr("sym_name")
         if name == "tt.call":
             op.get_flat_symbol_ref_attr("callee")
+        if name == "tt.make_range":
+            assert 0 == op.get_int_attr("start")
+            assert _BLOCK_SIZE == op.get_int_attr("end")
+        if name == "arith.constant":
+            val = op.get_constant_value()
+            assert isinstance(val, int)
+        if name == "tt.expand_dims":
+            shape = op.get_result(0).get_shape()
+            assert shape == [1, _BLOCK_SIZE]
+        if name == "tt.reshape":
+            in_shape = op.get_operand(0).get_shape()
+            out_shape = op.get_result(0).get_shape()
+            assert in_shape == [1, _BLOCK_SIZE]
+            assert out_shape == [_BLOCK_SIZE]
 
     kernel = add_kernel
     args = [
@@ -57,7 +75,7 @@ def test_module_walk(device):
         torch.empty((32, 32), device=device),  # in_ptr1
         1024,  # n_elements
         torch.empty((32, 32), device=device),  # out_ptr
-        16,  # BLOCK_SIZE
+        _BLOCK_SIZE,  # BLOCK_SIZE
     ]
     target = triton.runtime.driver.active.get_current_target()
     backend = triton.compiler.compiler.make_backend(target)

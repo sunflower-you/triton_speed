@@ -64,7 +64,7 @@ Linear Algebra Ops
 
 
 Memory/Pointer Ops
-----------
+------------------
 
 .. autosummary::
     :toctree: generated
@@ -150,6 +150,7 @@ Scan/Sort Ops
     cumsum
     histogram
     sort
+    topk
     gather
 
 Atomic Ops

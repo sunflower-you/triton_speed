@@ -8,7 +8,7 @@
 
 namespace proton {
 
-class BufferException : public std::runtime_error {
+class BufferException : public std::out_of_range {
 public:
   explicit BufferException(const std::string &message);
 };
@@ -24,6 +24,8 @@ public:
   int16_t readInt16();
   uint32_t readUInt32();
   int32_t readInt32();
+  uint64_t readUInt64();
+  int64_t readInt64();
 
   // Buffer navigation
   void skip(size_t count);

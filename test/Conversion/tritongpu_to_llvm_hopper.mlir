@@ -1,19 +1,31 @@
 // RUN: triton-opt %s -split-input-file --allocate-shared-memory-nv='compute-capability=90 ptx-version=81' --convert-triton-gpu-to-llvm='compute-capability=90 ptx-version=81' | FileCheck %s
 
-#mma = #ttg.nvidia_mma<{versionMajor = 3, versionMinor = 0, warpsPerCTA = [8, 1], CTAsPerCGA = [1, 1], CTASplitNum = [1, 1], CTAOrder = [1, 0], instrShape = [16, 256, 32]}>
+module attributes {"ttg.num-ctas" = 4 : i32, "ttg.num-warps" = 4 : i32} {
+  // CHECK-LABEL: @test_cluster_attr
+  // CHECK: nvvm.cluster_dim = array<i32: 4>
+  // CHECK: nvvm.kernel = 1 : ui1
+  // CHECK: nvvm.reqntid = array<i32: 128>
+  tt.func @test_cluster_attr(%lb : index, %A : !tt.ptr<f16>) {
+    tt.return
+  }
+}
+
+// -----
+
+#mma = #ttg.nvidia_mma<{versionMajor = 3, versionMinor = 0, warpsPerCTA = [8, 1], instrShape = [16, 256, 32]}>
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 32, transposed = false, elementBitWidth = 8}>
 #shared1 = #ttg.nvmma_shared<{swizzlingByteWidth = 32, transposed = true, elementBitWidth = 8}>
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32} {
   // CHECK-LABEL: @dot_high_precision_acc
   tt.func @dot_high_precision_acc(%a: !ttg.memdesc<128x128xf8E5M2, #shared, #smem>, %b: !ttg.memdesc<128x256xf8E5M2, #shared1, #smem>, %c: tensor<128x256xf32, #mma>) {
-    // CHECK: nvgpu.wgmma
+    // CHECK: nvg.wgmma
     // CHECK-COUNT-128: llvm.fadd
-    // CHECK: nvgpu.wgmma
+    // CHECK: nvg.wgmma
     // CHECK-COUNT-128: llvm.fadd
-    // CHECK: nvgpu.wgmma
+    // CHECK: nvg.wgmma
     // CHECK-COUNT-128: llvm.fadd
-    // CHECK: nvgpu.wgmma
+    // CHECK: nvg.wgmma
     // CHECK-COUNT-128: llvm.fadd
     %m = ttng.warp_group_dot %a, %b, %c
       {maxNumImpreciseAcc = 32 : i32, inputPrecision = 0 : i32} :
@@ -24,20 +36,20 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32} {
 
 // -----
 
-#mma = #ttg.nvidia_mma<{versionMajor = 3, versionMinor = 0, warpsPerCTA = [8, 1], CTAsPerCGA = [1, 1], CTASplitNum = [1, 1], CTAOrder = [1, 0], instrShape = [16, 256, 32]}>
+#mma = #ttg.nvidia_mma<{versionMajor = 3, versionMinor = 0, warpsPerCTA = [8, 1], instrShape = [16, 256, 32]}>
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 32, transposed = false, elementBitWidth = 8}>
 #shared1 = #ttg.nvmma_shared<{swizzlingByteWidth = 32, transposed = true, elementBitWidth = 8}>
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32} {
   // CHECK-LABEL: @dot_low_precision_acc
   tt.func @dot_low_precision_acc(%a: !ttg.memdesc<128x128xf8E5M2, #shared, #smem>, %b: !ttg.memdesc<128x256xf8E5M2, #shared1, #smem>, %c: tensor<128x256xf32, #mma>) {
-    // CHECK: nvgpu.wgmma
+    // CHECK: nvg.wgmma
     // CHECK-NOT: llvm.fadd
-    // CHECK: nvgpu.wgmma
+    // CHECK: nvg.wgmma
     // CHECK-NOT: llvm.fadd
-    // CHECK: nvgpu.wgmma
+    // CHECK: nvg.wgmma
     // CHECK-NOT: llvm.fadd
-    // CHECK: nvgpu.wgmma
+    // CHECK: nvg.wgmma
     // CHECK-NOT: llvm.fadd
     // CHECK: llvm.return
     %m = ttng.warp_group_dot %a, %b, %c
@@ -49,20 +61,20 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32} {
 
 // -----
 
-#mma = #ttg.nvidia_mma<{versionMajor = 3, versionMinor = 0, warpsPerCTA = [8, 1], CTAsPerCGA = [1, 1], CTASplitNum = [1, 1], CTAOrder = [1, 0], instrShape = [16, 256, 32]}>
+#mma = #ttg.nvidia_mma<{versionMajor = 3, versionMinor = 0, warpsPerCTA = [8, 1], instrShape = [16, 256, 32]}>
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 32, transposed = false, elementBitWidth = 8}>
 #shared1 = #ttg.nvmma_shared<{swizzlingByteWidth = 32, transposed = true, elementBitWidth = 8}>
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32} {
   // CHECK-LABEL: @dot_mix_precision_acc
   tt.func @dot_mix_precision_acc(%a: !ttg.memdesc<128x128xf8E5M2, #shared, #smem>, %b: !ttg.memdesc<128x256xf8E5M2, #shared1, #smem>, %c: tensor<128x256xf32, #mma>) {
-    // CHECK: nvgpu.wgmma
+    // CHECK: nvg.wgmma
     // CHECK-NOT: llvm.fadd
-    // CHECK: nvgpu.wgmma
+    // CHECK: nvg.wgmma
     // CHECK-COUNT-128: llvm.fadd
-    // CHECK: nvgpu.wgmma
+    // CHECK: nvg.wgmma
     // CHECK-NOT: llvm.fadd
-    // CHECK: nvgpu.wgmma
+    // CHECK: nvg.wgmma
     // CHECK-COUNT-128: llvm.fadd
     // CHECK: llvm.return
     %m = ttng.warp_group_dot %a, %b, %c
@@ -74,14 +86,32 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32} {
 
 // -----
 
-#mma = #ttg.nvidia_mma<{versionMajor = 3, versionMinor = 0, warpsPerCTA = [4, 1], CTAsPerCGA = [1, 1], CTASplitNum = [1, 1], CTAOrder = [1, 0], instrShape = [16, 64, 16]}>
+#mma = #ttg.nvidia_mma<{versionMajor = 3, versionMinor = 0, warpsPerCTA = [16, 2], instrShape = [16, 256, 16]}>
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = true, elementBitWidth = 16}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 32 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: @warp_group_dot_bf16_32_warps
+  tt.func @warp_group_dot_bf16_32_warps(
+      %a: !ttg.memdesc<256x128xbf16, #shared, #smem>,
+      %b: !ttg.memdesc<128x512xbf16, #shared, #smem>,
+      %acc: tensor<256x512xf32, #mma>) {
+    %res = ttng.warp_group_dot %a, %b, %acc {inputPrecision = 0 : i32, isAsync = true} :
+      !ttg.memdesc<256x128xbf16, #shared, #smem> * !ttg.memdesc<128x512xbf16, #shared, #smem> -> tensor<256x512xf32, #mma>
+    // CHECK: nvg.wgmma {{.*}} k = 16 : i32, layoutA = 1 : i32, layoutB = 1 : i32, m = 64 : i32, n = 256 : i32}
+    tt.return
+  }
+}
+
+// -----
+
+#mma = #ttg.nvidia_mma<{versionMajor = 3, versionMinor = 0, warpsPerCTA = [4, 1], instrShape = [16, 64, 16]}>
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
 #shared1 = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = true, elementBitWidth = 16}>
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
   // CHECK-LABEL: @dot_zero_acc
   // Generate a wgmma with 2 sources.
-  // CHECK: nvgpu.wgmma %{{.*}}, %{{.*}} {
+  // CHECK: nvg.wgmma %{{.*}}, %{{.*}} {
   tt.func @dot_zero_acc(%a: !ttg.memdesc<128x64xf16, #shared, #smem>, %b: !ttg.memdesc<64x64xf16, #shared1, #smem>) {
     %cst = arith.constant dense<0.000000e+00> : tensor<128x64xf32, #mma>
     %m = ttng.warp_group_dot %a, %b, %cst {inputPrecision = 0 : i32, maxNumImpreciseAcc = 0 : i32} :
@@ -90,7 +120,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
   }
 
   // CHECK-LABEL: @wgmma_on_subtile
-  // CHECK: nvgpu.wgmma %{{.*}}, %{{.*}}
+  // CHECK: nvg.wgmma %{{.*}}, %{{.*}}
   tt.func @wgmma_on_subtile(%a: tensor<128x16xf16, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 2}>>, %b:  !ttg.memdesc<16x256xf16, #shared1, #smem, mutable, 3x64x256>){
     %cst = arith.constant dense<0.000000e+00> : tensor<128x256xf32, #mma>
     %m = ttng.warp_group_dot %a, %b, %cst {inputPrecision = 0 : i32, isAsync = true} : tensor<128x16xf16, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 2}>> * !ttg.memdesc<16x256xf16, #shared1, #smem, mutable, 3x64x256> -> tensor<128x256xf32, #mma>
@@ -100,14 +130,24 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
 
 // -----
 
-#mma = #ttg.nvidia_mma<{versionMajor = 3, versionMinor = 0, warpsPerCTA = [4, 1], CTAsPerCGA = [1, 1], CTASplitNum = [1, 1], CTAOrder = [1, 0], instrShape = [16, 64, 16]}>
+#mma = #ttg.nvidia_mma<{versionMajor = 3, versionMinor = 0, warpsPerCTA = [4, 1], instrShape = [16, 64, 16]}>
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = true, elementBitWidth = 16}>
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
   // CHECK-LABEL: @dot_reg_operand_A
   // Generate a wgmma where the first operand is a struct.
-  // CHECK: nvgpu.wgmma {{.*}} : (!llvm.struct<(i32, i32, i32, i32)>, i64, i1) -> !llvm.struct<(f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32)>
-  // CHECK: nvgpu.wgmma_wait_group %{{.*}} {pendings = 0 : i32} : !llvm.struct<(f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32)>
+  // CHECK: %[[A_MOV0:.*]] = llvm.inline_asm has_side_effects asm_dialect = att operand_attrs = [] "mov.b32 $0, $1;", "=r,r" %{{.*}} : (i32) -> i32
+  // CHECK: %[[A_MOV1:.*]] = llvm.inline_asm has_side_effects asm_dialect = att operand_attrs = [] "mov.b32 $0, $1;", "=r,r" %{{.*}} : (i32) -> i32
+  // CHECK: %[[A_MOV2:.*]] = llvm.inline_asm has_side_effects asm_dialect = att operand_attrs = [] "mov.b32 $0, $1;", "=r,r" %{{.*}} : (i32) -> i32
+  // CHECK: %[[A_MOV3:.*]] = llvm.inline_asm has_side_effects asm_dialect = att operand_attrs = [] "mov.b32 $0, $1;", "=r,r" %{{.*}} : (i32) -> i32
+  // CHECK: nvvm.wgmma.fence.aligned
+  // CHECK: %[[A_PACK0:.*]] = llvm.insertvalue %[[A_MOV0]], %{{.*}}[0] : !llvm.struct<(i32, i32, i32, i32)>
+  // CHECK: %[[A_PACK1:.*]] = llvm.insertvalue %[[A_MOV1]], %[[A_PACK0]][1] : !llvm.struct<(i32, i32, i32, i32)>
+  // CHECK: %[[A_PACK2:.*]] = llvm.insertvalue %[[A_MOV2]], %[[A_PACK1]][2] : !llvm.struct<(i32, i32, i32, i32)>
+  // CHECK: %[[A_PACK3:.*]] = llvm.insertvalue %[[A_MOV3]], %[[A_PACK2]][3] : !llvm.struct<(i32, i32, i32, i32)>
+  // CHECK: nvg.wgmma %[[A_PACK3]], %{{.*}}
+  // CHECK: nvg.wgmma {{.*}} : (!llvm.struct<(i32, i32, i32, i32)>, i64, i1) -> !llvm.struct<(f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32)>
+  // CHECK: nvg.wgmma_wait_group %{{.*}} {pendings = 0 : i32} : !llvm.struct<(f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32)>
   tt.func @dot_reg_operand_A(%a: tensor<128x64xf16, #mma>, %b: !ttg.memdesc<64x64xf16, #shared, #smem>) {
     %cst = arith.constant dense<0.000000e+00> : tensor<128x64xf32, #mma>
     %opA = ttg.convert_layout %a : tensor<128x64xf16, #mma> -> tensor<128x64xf16, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 2}>>
@@ -126,8 +166,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32} {
   // CHECK-LABEL: @dot_reg_operand_A_fp8
   // Generate a wgmma where the first operand is a struct.
-  // CHECK: nvgpu.wgmma {{.*}} : (!llvm.struct<(i32, i32, i32, i32)>, i64, i1) -> !llvm.struct<(f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32)>
-  // CHECK: nvgpu.wgmma_wait_group %{{.*}} {pendings = 0 : i32}
+  // CHECK: nvg.wgmma {{.*}} : (!llvm.struct<(i32, i32, i32, i32)>, i64, i1) -> !llvm.struct<(f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32)>
+  // CHECK: nvg.wgmma_wait_group %{{.*}} {pendings = 0 : i32}
   tt.func @dot_reg_operand_A_fp8(%a: tensor<128x128xf8E5M2, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 4}>>, %b: !ttg.memdesc<128x256xf8E5M2, #shared, #smem>) {
     %cst = arith.constant dense<0.000000e+00> : tensor<128x256xf32, #mma1>
     %m = ttng.warp_group_dot %a, %b, %cst { maxNumImpreciseAcc = 1073741824 : i32, inputPrecision = 0 : i32 } :
@@ -139,23 +179,24 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32} {
 // -----
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 16], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [1, 0]}>
-#mma = #ttg.nvidia_mma<{versionMajor = 3, versionMinor = 0, warpsPerCTA = [4, 1], CTAsPerCGA = [1, 1], CTASplitNum = [1, 1], CTAOrder = [1, 0], instrShape = [16, 64, 16]}>
+#mma = #ttg.nvidia_mma<{versionMajor = 3, versionMinor = 0, warpsPerCTA = [4, 1], instrShape = [16, 64, 16]}>
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = true, elementBitWidth = 8}>
+#shared1 = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = true, elementBitWidth = 16}>
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
   // CHECK-LABEL: dot_reg_operand_upcast
-  tt.func @dot_reg_operand_upcast(%a_desc: !ttg.memdesc<128x64xi8, #shared, #smem>, %b: !ttg.memdesc<64x64xf16, #shared, #smem>, %acc: tensor<128x64xf32, #mma>) {
+  tt.func @dot_reg_operand_upcast(%a_desc: !ttg.memdesc<128x64xi8, #shared, #smem>, %b: !ttg.memdesc<64x64xf16, #shared1, #smem>, %acc: tensor<128x64xf32, #mma>) {
     %a_dotop = ttg.local_load %a_desc : !ttg.memdesc<128x64xi8, #shared, #smem> -> tensor<128x64xi8, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 2}>>
     %a_casted = arith.sitofp %a_dotop : tensor<128x64xi8, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 2}>> to tensor<128x64xf16, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 2}>>
-    %res = ttng.warp_group_dot %a_casted, %b, %acc : tensor<128x64xf16, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 2}>> * !ttg.memdesc<64x64xf16, #shared, #smem> -> tensor<128x64xf32, #mma>
+    %res = ttng.warp_group_dot %a_casted, %b, %acc : tensor<128x64xf16, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 2}>> * !ttg.memdesc<64x64xf16, #shared1, #smem> -> tensor<128x64xf32, #mma>
     tt.return
   }
 }
 
 // -----
 
-#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [1], order = [0], CTAsPerCGA = [1], CTASplitNum = [1], CTAOrder = [0]}>
-#blocked1 = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [32], warpsPerCTA = [1], order = [0], CTAsPerCGA = [1], CTASplitNum = [1], CTAOrder = [0]}>
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [1], order = [0]}>
+#blocked1 = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [32], warpsPerCTA = [1], order = [0]}>
 module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32} {
   // CHECK-LABEL: test_fp8_to_f16_conversion
   tt.func @test_fp8_to_f16_conversion(
@@ -183,7 +224,7 @@ module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-
 
 // -----
 
-#blocked = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [32], warpsPerCTA = [4], order = [0], CTAsPerCGA = [1], CTASplitNum = [1], CTAOrder = [0]}>
+#blocked = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
 // CHECK-LABEL: clamp
 module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
   tt.func public @clamp(%x : tensor<1024xf32, #blocked>, %limit : tensor<1024xf32, #blocked>) {
@@ -198,6 +239,63 @@ module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-
 
 // -----
 
+#blocked = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+// CHECK-LABEL: clamp_splat_negf
+module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @clamp_splat_negf(%x : tensor<1024xf32, #blocked>, %limit : f32) {
+    %neg_limit = arith.negf %limit : f32
+    %lower = tt.splat %neg_limit : f32 -> tensor<1024xf32, #blocked>
+    %upper = tt.splat %limit : f32 -> tensor<1024xf32, #blocked>
+
+    // CHECK-COUNT-8: nvvm.fmin.xorsign.abs.f
+    %12 = tt.clampf %x, %lower, %upper, propagateNan = none : tensor<1024xf32, #blocked>
+    tt.return
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+// CHECK-LABEL: clamp_negf
+module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @clamp_negf(%x : tensor<1024xf32, #blocked>, %limit : tensor<1024xf32, #blocked>) {
+    %neg_limit = arith.negf %limit : tensor<1024xf32, #blocked>
+
+    // CHECK-COUNT-8: nvvm.fmin.xorsign.abs.f
+    %12 = tt.clampf %x, %neg_limit, %limit, propagateNan = none : tensor<1024xf32, #blocked>
+    tt.return
+  }
+}
+
+// -----
+
+// CHECK-LABEL: clamp_negf_scalar
+module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @clamp_negf_scalar(%x : f32, %limit : f32) {
+    %neg_limit = arith.negf %limit : f32
+
+    // CHECK: nvvm.fmin.xorsign.abs.f
+    %12 = tt.clampf %x, %neg_limit, %limit, propagateNan = none : f32
+    tt.return
+  }
+}
+
+// -----
+
+// CHECK-LABEL: clamp_scalar
+module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @clamp_scalar(%x : f32, %limit : f32) {
+    %cst = arith.constant 0.000000e+00 : f32
+    %neg_limit = arith.subf %cst, %limit : f32
+
+    // CHECK: nvvm.fmin.xorsign.abs.f
+    %12 = tt.clampf %x, %neg_limit, %limit, propagateNan = none : f32
+    tt.return
+  }
+}
+
+// -----
+
 #blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [1, 32], warpsPerCTA = [8, 1], order = [0, 1]}>
 #mma = #ttg.nvidia_mma<{versionMajor = 3, versionMinor = 0, warpsPerCTA = [8, 1], instrShape = [16, 256, 16]}>
 // CHECK-LABEL: convert_mma_to_blocked
@@ -205,12 +303,40 @@ module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-
   tt.func @convert_mma_to_blocked(%a: tensor<128x256xf16, #mma>) {
     // CHECK-COUNT-8: llvm.store
     //          CHECK: nvvm.barrier0
-    // CHECK-COUNT-8: nvgpu.ldmatrix
+    // CHECK-COUNT-8: nvvm.ldmatrix
     //          CHECK: nvvm.barrier0
     // CHECK-COUNT-8: llvm.store
     //          CHECK: nvvm.barrier0
-    // CHECK-COUNT-8: nvgpu.ldmatrix
+    // CHECK-COUNT-8: nvvm.ldmatrix
     %c = ttg.convert_layout %a : tensor<128x256xf16, #mma> -> tensor<128x256xf16, #blocked>
+    tt.return
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1, 32], threadsPerWarp = [32, 1], warpsPerCTA = [4, 2], order = [0, 1]}>
+#linear = #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [0, 32]], warp = [[32, 0], [64, 0], [16, 0]], block = []}>
+module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @convert_mma_to_blocked(%a: tensor<128x64xbf16, #linear>) {
+    // CHECK: llvm.store {{.*}} : vector<4xi32>
+    // CHECK: nvvm.barrier0
+    // CHECK: llvm.load {{.*}} -> vector<4xi32>
+    // CHECK: nvvm.barrier0
+    // CHECK: llvm.store {{.*}} : vector<4xi32>
+    // CHECK: nvvm.barrier0
+    // CHECK: llvm.load {{.*}} -> vector<4xi32>
+    // CHECK: nvvm.barrier0
+    // CHECK: llvm.store {{.*}} : vector<4xi32>
+    // CHECK: nvvm.barrier0
+    // CHECK: llvm.load {{.*}} -> vector<4xi32>
+    // CHECK: nvvm.barrier0
+    // CHECK: llvm.store {{.*}} : vector<4xi32>
+    // CHECK: nvvm.barrier0
+    // CHECK: llvm.load {{.*}} -> vector<4xi32>
+    // CHECK-NOT: llvm.store
+    // CHECK-NOT: llvm.load
+    %b = ttg.convert_layout %a: tensor<128x64xbf16, #linear> -> tensor<128x64xbf16, #blocked>
     tt.return
   }
 }
@@ -225,19 +351,19 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
   tt.func @convert_blocked_to_dot_rhs(%a: tensor<64x64xf16, #blocked>) {
     // CHECK-COUNT-1: llvm.store
     //          CHECK: nvvm.barrier0
-    // CHECK-COUNT-4: nvgpu.ldmatrix
+    // CHECK-COUNT-4: nvvm.ldmatrix
     //          CHECK: nvvm.barrier0
     // CHECK-COUNT-1: llvm.store
     //          CHECK: nvvm.barrier0
-    // CHECK-COUNT-4: nvgpu.ldmatrix
+    // CHECK-COUNT-4: nvvm.ldmatrix
     //          CHECK: nvvm.barrier0
     // CHECK-COUNT-1: llvm.store
     //          CHECK: nvvm.barrier0
-    // CHECK-COUNT-4: nvgpu.ldmatrix
+    // CHECK-COUNT-4: nvvm.ldmatrix
     //          CHECK: nvvm.barrier0
     // CHECK-COUNT-1: llvm.store
     //          CHECK: nvvm.barrier0
-    // CHECK-COUNT-4: nvgpu.ldmatrix
+    // CHECK-COUNT-4: nvvm.ldmatrix
     %b = ttg.convert_layout %a  : tensor<64x64xf16, #blocked> -> tensor<64x64xf16, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 2}>>
     tt.return
   }
@@ -245,7 +371,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
 
 // -----
 
-#mma = #ttg.nvidia_mma<{versionMajor = 3, versionMinor = 0, warpsPerCTA = [4, 1], CTAsPerCGA = [1, 1], CTASplitNum = [1, 1], CTAOrder = [1, 0], instrShape = [16, 64, 16]}>
+#mma = #ttg.nvidia_mma<{versionMajor = 3, versionMinor = 0, warpsPerCTA = [4, 1], instrShape = [16, 64, 16]}>
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = true, elementBitWidth = 8}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
 // CHECK-LABEL: cvt_mma_to_dot_fp8
@@ -463,7 +589,7 @@ module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-
 
 // -----
 
-#blocked = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [32], warpsPerCTA = [2], order = [0], CTAsPerCGA = [1], CTASplitNum = [1], CTAOrder = [0]}>
+#blocked = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [32], warpsPerCTA = [2], order = [0]}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 2 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
   tt.func public @atomic_add_f32_nomask(%dest_ptrs: tensor<256x!tt.ptr<f32>, #blocked> {tt.divisibility = 16 : i32, tt.contiguity = 16 : i32}, %data: tensor<256xf32, #blocked>) {
     // CHECK-LABEL: atomic_add_f32_nomask
@@ -475,7 +601,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 2 : i32, ttg.targ
 
 // -----
 
-#blocked = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [32], warpsPerCTA = [2], order = [0], CTAsPerCGA = [1], CTASplitNum = [1], CTAOrder = [0]}>
+#blocked = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [32], warpsPerCTA = [2], order = [0]}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 2 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
   tt.func public @atomic_add_f32_withmask(%dest_ptrs: tensor<256x!tt.ptr<f32>, #blocked> {tt.divisibility = 16 : i32, tt.contiguity = 16 : i32}, %data: tensor<256xf32, #blocked>, %mask: tensor<256xi1, #blocked> {tt.constancy = 2 : i32}) {
     // CHECK-LABEL: atomic_add_f32_withmask
@@ -488,7 +614,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 2 : i32, ttg.targ
 
 // -----
 
-#blocked = #ttg.blocked<{sizePerThread = [8], threadsPerWarp = [32], warpsPerCTA = [1], order = [0], CTAsPerCGA = [1], CTASplitNum = [1], CTAOrder = [0]}>
+#blocked = #ttg.blocked<{sizePerThread = [8], threadsPerWarp = [32], warpsPerCTA = [1], order = [0]}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
   tt.func public @atomic_add_f16_withmask(%dest_ptrs: tensor<256x!tt.ptr<f16>, #blocked> {tt.divisibility = 16 : i32, tt.contiguity = 16 : i32}, %data: tensor<256xf16, #blocked>, %mask: tensor<256xi1, #blocked> {tt.constancy = 4 : i32}) {
     // CHECK-LABEL: atomic_add_f16_withmask
@@ -529,9 +655,9 @@ module attributes {ttg.global_scratch_memory_alignment = 1 : i32, ttg.global_scr
     %3 = ttg.local_load %1 : !ttg.memdesc<16x16xf64, #shared1, #smem, mutable> -> tensor<16x16xf64, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 1}>>
 
     // CHECK: llvm.inline_asm
-    // CHECK-SAME: mma.sync.aligned.m16n8k16.row.col.f64.f64.f64.f64
+    // CHECK-SAME: mma.sync.aligned.m8n8k4.row.col.f64.f64.f64.f64
     // CHECK: llvm.inline_asm
-    // CHECK-SAME: mma.sync.aligned.m16n8k16.row.col.f64.f64.f64.f64
+    // CHECK-SAME: mma.sync.aligned.m8n8k4.row.col.f64.f64.f64.f64
 
     %out = tt.dot %2, %3, %cst, inputPrecision = tf32 : tensor<16x16xf64, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 1}>> * tensor<16x16xf64, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 1}>> -> tensor<16x16xf64, #mma>
 
@@ -547,13 +673,13 @@ module attributes {"ttg.target" = "cuda:90", "ttg.num-warps" = 4 : i32} {
 
 // CHECK-LABEL: @warpgroup_dot_wait_1_input
 tt.func @warpgroup_dot_wait_1_input(%arg0: tensor<128xf32, #blocked>) {
-  // CHECK: nvgpu.wgmma_wait_group
+  // CHECK: nvg.wgmma_wait_group
   ttng.warp_group_dot_wait %arg0 {pendings = 0 : i32} : tensor<128xf32, #blocked>
   tt.return
 }
 
 tt.func @warpgroup_dot_wait_2_inputs(%arg0: tensor<128xf32, #blocked>, %arg1: tensor<128xf32, #blocked>) {
-  // CHECK: nvgpu.wgmma_wait_group
+  // CHECK: nvg.wgmma_wait_group
   ttng.warp_group_dot_wait %arg0, %arg1 {pendings = 0 : i32} : tensor<128xf32, #blocked>, tensor<128xf32, #blocked>
   tt.return
 }

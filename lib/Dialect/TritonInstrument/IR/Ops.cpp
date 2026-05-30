@@ -1,155 +1,86 @@
+#include "mlir/IR/PatternMatch.h"
+#include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonInstrument/IR/Dialect.h"
+#include "triton/Dialect/TritonInstrument/IR/Utility.h"
 
 #define GET_OP_CLASSES
 #include "triton/Dialect/TritonInstrument/IR/Ops.cpp.inc"
 
 #include "triton/Dialect/TritonInstrument/IR/OpsEnums.cpp.inc"
 
-using namespace mlir;
-namespace {
-// readBars/writeBars should have encoding that ensures that all its elements
-// reside in a single thread
-bool verifyBarsEncoding(RankedTensorType readBarsType) {
-  auto encoding =
-      cast<triton::gpu::BlockedEncodingAttr>(readBarsType.getEncoding());
-  int rank = encoding.getRank();
-  if (rank != readBarsType.getRank() || rank != 2)
-    return false;
-  for (int i = 0; i < rank; ++i) {
-    if (encoding.getSizePerThread()[i] != readBarsType.getShape()[i])
-      return false;
+namespace mlir {
+namespace triton {
+namespace instrument {
+
+namespace tt = mlir::triton;
+namespace ttg = mlir::triton::gpu;
+
+template <typename ViewOp, typename FPSanOp>
+struct PushFPSanThroughViewPattern : public OpRewritePattern<ViewOp> {
+  using OpRewritePattern<ViewOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(ViewOp view,
+                                PatternRewriter &rewriter) const override {
+    auto fpsan = view->getOperand(0).template getDefiningOp<FPSanOp>();
+    if (!fpsan)
+      return failure();
+
+    auto resultTy = dyn_cast<RankedTensorType>(view->getResult(0).getType());
+    auto payloadTy = dyn_cast<RankedTensorType>(fpsan.getVal().getType());
+    if (!resultTy || !payloadTy)
+      return failure();
+
+    auto payloadViewTy = resultTy.clone(payloadTy.getElementType());
+    OperationState state(view.getLoc(), view->getName());
+    state.addOperands(fpsan.getVal());
+    state.addTypes(payloadViewTy);
+    state.addAttributes(view->getAttrs());
+    Operation *payloadView = rewriter.create(state);
+    auto moved = FPSanOp::create(rewriter, view.getLoc(), resultTy,
+                                 payloadView->getResult(0));
+    rewriter.replaceOp(view, moved->getResults());
+    return success();
   }
-  return true;
-}
-} // namespace
+};
 
-namespace mlir::triton::instrument {
-
-LogicalResult ExperimentalCheckWriteStateOp::verify() {
-  auto writeStateType = cast<RankedTensorType>(getWriteStateType());
-  auto buffersType = getBuffers().getType();
-  if (writeStateType.getShape() != buffersType.getShape() ||
-      writeStateType.getEncoding() != buffersType.getEncoding())
-    return emitError()
-           << "writeState and buffers must have the same shape and encoding";
-  auto writeBarsType = cast<RankedTensorType>(getWriteBarsType());
-  // writeBars is 2D tensor of shape [num_buffers, num_barriers]
-  if (writeBarsType.getShape()[0] != buffersType.getShape()[0])
-    return emitError() << "writeBars dim 0 must match number of buffers";
-
-  if (!verifyBarsEncoding(writeBarsType))
-    return emitError() << "writeBars must have encoding that ensures that all "
-                          "its elements reside in a single thread";
-  return success();
+template <typename FPSanOp>
+void addPushFPSanThroughViewPatterns(RewritePatternSet &patterns,
+                                     MLIRContext *context) {
+  patterns.add<PushFPSanThroughViewPattern<ttg::ConvertLayoutOp, FPSanOp>,
+               PushFPSanThroughViewPattern<tt::TransOp, FPSanOp>,
+               PushFPSanThroughViewPattern<tt::ReshapeOp, FPSanOp>,
+               PushFPSanThroughViewPattern<tt::BroadcastOp, FPSanOp>,
+               PushFPSanThroughViewPattern<tt::ExpandDimsOp, FPSanOp>>(context);
 }
 
-LogicalResult ExperimentalCheckReadBarriersOp::verify() {
-  auto readBarsType = cast<RankedTensorType>(getReadBarsType());
-  auto buffersType = getBuffers().getType();
-  // readBars is 2D tensor of shape [num_buffers, num_barriers]
-  if (readBarsType.getShape()[0] != buffersType.getShape()[0])
-    return emitError() << "readBars dim 0 must match number of buffers";
-
-  if (!verifyBarsEncoding(readBarsType))
-    return emitError() << "readBars must have encoding that ensures that all "
-                          "its elements reside in a single thread";
-  return success();
+void ExperimentalFPSanEmbedOp::getCanonicalizationPatterns(
+    RewritePatternSet &patterns, MLIRContext *context) {
+  // view(embed(x)) -> embed(view(x))
+  addPushFPSanThroughViewPatterns<ExperimentalFPSanEmbedOp>(patterns, context);
 }
 
-LogicalResult ExperimentalSetWriteStateOp::verify() {
-  auto buffersType = getBuffers().getType();
-  auto writeStateType = cast<RankedTensorType>(getWriteStateType());
-  if (writeStateType.getShape() != buffersType.getShape() ||
-      writeStateType.getEncoding() != buffersType.getEncoding())
-    return emitError()
-           << "writeState and buffers must have the same shape and encoding";
-  return success();
+OpFoldResult ExperimentalFPSanEmbedOp::fold(FoldAdaptor adaptor) {
+  if (auto unembed = getVal().getDefiningOp<ExperimentalFPSanUnembedOp>())
+    if (unembed.getVal().getType() == getType())
+      return unembed.getVal();
+  return {};
 }
 
-LogicalResult ExperimentalCommitWriteWithBarrierOp::verify() {
-  auto writeBarsType = cast<RankedTensorType>(getWriteBarsType());
-  auto writeStateType = cast<RankedTensorType>(getWriteStateType());
-  auto barriersType = getBarriers().getType();
-  if (writeBarsType.getShape()[0] != writeStateType.getShape()[0])
-    return emitError()
-           << "writeBars and writeState must have the same number of buffers";
-  if (writeBarsType.getShape()[1] != barriersType.getShape()[0])
-    return emitError() << "writeBars dim 1 must match number of barriers";
-  if (!verifyBarsEncoding(writeBarsType))
-    return emitError() << "writeBars must have encoding that ensures that all "
-                          "its elements reside in a single thread";
-  return success();
+void ExperimentalFPSanUnembedOp::getCanonicalizationPatterns(
+    RewritePatternSet &patterns, MLIRContext *context) {
+  // view(unembed(x)) -> unembed(view(x))
+  addPushFPSanThroughViewPatterns<ExperimentalFPSanUnembedOp>(patterns,
+                                                              context);
 }
 
-LogicalResult ExperimentalSetReadBarrierOp::verify() {
-  auto buffersType = getBuffers().getType();
-  auto barriersType = getBarriers().getType();
-  auto readBarsType = cast<RankedTensorType>(getReadBarsType());
-  // readBars is 2D tensor of shape [num_buffers, num_barriers]
-  if (readBarsType.getShape()[0] != buffersType.getShape()[0])
-    return emitError() << "readBars dim 0 must match number of buffers";
-  if (readBarsType.getShape()[1] != barriersType.getShape()[0])
-    return emitError() << "readBars dim 1 must match number of barriers";
-  if (!verifyBarsEncoding(readBarsType))
-    return emitError() << "readBars must have encoding that ensures that all "
-                          "its elements reside in a single thread";
-  return success();
+OpFoldResult ExperimentalFPSanUnembedOp::fold(FoldAdaptor adaptor) {
+  if (auto embed = getVal().getDefiningOp<ExperimentalFPSanEmbedOp>())
+    if (embed.getVal().getType() == getType())
+      return embed.getVal();
+  return {};
 }
 
-LogicalResult ExperimentalClearWriteBarrierOp::verify() {
-  auto writeBarsType = cast<RankedTensorType>(getWriteBarsType());
-  auto barriersType = getBarriers().getType();
-  auto writeStateType = cast<RankedTensorType>(getWriteStateType());
-  if (writeBarsType.getShape()[0] != writeStateType.getShape()[0])
-    return emitError()
-           << "writeBars and writeState must have the same number of buffers";
-  if (writeBarsType.getShape()[1] != barriersType.getShape()[0])
-    return emitError() << "writeBars dim 1 must match number of barriers";
-  if (!verifyBarsEncoding(writeBarsType))
-    return emitError() << "writeBars must have encoding that ensures that all "
-                          "its elements reside in a single thread";
-  return success();
-}
-
-LogicalResult ExperimentalClearReadBarrierOp::verify() {
-  auto readBarsType = cast<RankedTensorType>(getReadBarsType());
-  auto barriersType = getBarriers().getType();
-  // readBars is 2D tensor of shape [num_buffers, num_barriers]
-  if (readBarsType.getShape()[1] != barriersType.getShape()[0])
-    return emitError() << "readBars dim 0 must match number of barriers";
-  if (!verifyBarsEncoding(readBarsType))
-    return emitError() << "readBars must have encoding that ensures that all "
-                          "its elements reside in a single thread";
-  return success();
-}
-
-LogicalResult ExperimentalCheckBarrierWritesClearedOp::verify() {
-  auto writeBarsType = cast<RankedTensorType>(getWriteBarsType());
-  auto barriersType = getBarriers().getType();
-  if (writeBarsType.getShape()[1] != barriersType.getShape()[0])
-    return emitError() << "writeBars dim 1 must match number of barriers";
-  return success();
-}
-
-LogicalResult ExperimentalStageAccessForCommitOp::verify() {
-  auto buffersType = getBuffers().getType();
-  auto outstandingCommitsType =
-      cast<RankedTensorType>(getOutstandingCommitsType());
-  if (buffersType.getShape()[0] != outstandingCommitsType.getShape()[0])
-    return emitError()
-           << "buffers and outstandingCommits must have the same size";
-  return success();
-}
-
-LogicalResult ExperimentalCheckOutstandingCommitsOp::verify() {
-  auto buffersType = getBuffers().getType();
-  auto outstandingCommitsType =
-      cast<RankedTensorType>(getOutstandingCommitsType());
-  if (buffersType.getShape()[0] != outstandingCommitsType.getShape()[0])
-    return emitError()
-           << "buffers and outstandingCommits must have the same size";
-  return success();
-}
-
-} // namespace mlir::triton::instrument
+} // namespace instrument
+} // namespace triton
+} // namespace mlir
